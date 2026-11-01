@@ -86,6 +86,28 @@ async function stats() {
   const s = await pool.query("SELECT COALESCE(source,'مستقیم') src, COUNT(*)::int c FROM bale_users GROUP BY 1 ORDER BY c DESC LIMIT 8");
   return { users: u.rows[0].c, leads: l.rows[0].c, analyses: u.rows[0].a, sources: Object.fromEntries(s.rows.map(r => [r.src, r.c])) };
 }
+async function dashboard() {
+  const DAY = 86400000;
+  if (!pool) {
+    const us = [...mem.users.values()], now = Date.now();
+    const cnt = ms => us.filter(u => now - u.created < ms).length;
+    const act = ms => us.filter(u => now - (u.last || u.created) < ms).length;
+    const base = await stats();
+    return { ...base, today: cnt(DAY), week: cnt(7 * DAY), month: cnt(30 * DAY), active24: act(DAY), active7: act(7 * DAY), days: [], recent: us.slice(-5).reverse().map(u => ({ first_name: u.first_name, username: u.username, source: u.source })) };
+  }
+  const base = await stats();
+  const t = await pool.query(`SELECT
+    COUNT(*) FILTER (WHERE created_at > now() - interval '1 day')::int today,
+    COUNT(*) FILTER (WHERE created_at > now() - interval '7 days')::int week,
+    COUNT(*) FILTER (WHERE created_at > now() - interval '30 days')::int month,
+    COUNT(*) FILTER (WHERE last_seen > now() - interval '1 day')::int active24,
+    COUNT(*) FILTER (WHERE last_seen > now() - interval '7 days')::int active7
+    FROM bale_users`);
+  const d = await pool.query(`SELECT to_char(created_at AT TIME ZONE 'Asia/Tehran','MM/DD') day, COUNT(*)::int c FROM bale_users
+    WHERE created_at > now() - interval '7 days' GROUP BY 1 ORDER BY 1 DESC`);
+  const r = await pool.query('SELECT first_name, username, source FROM bale_users ORDER BY created_at DESC LIMIT 5');
+  return { ...base, ...t.rows[0], days: d.rows, recent: r.rows };
+}
 async function lastLeads() {
   if (!pool) return mem.leads.slice(-10).reverse();
   return (await pool.query('SELECT chat_id, phone, note, created_at AS at FROM bale_leads ORDER BY id DESC LIMIT 10')).rows;
@@ -237,6 +259,13 @@ async function adminCommand(chatId, text) {
     const src = Object.entries(s.sources).map(([k, v]) => `  ${k}: ${faDigits(v)}`).join('\n');
     return send(chatId, `📈 آمار ربات\nکاربران: ${faDigits(s.users)}\nتحلیل‌ها: ${faDigits(s.analyses)}\nدرخواست مشاوره: ${faDigits(s.leads)}` + (src ? `\n\nمنبع ورود:\n${src}` : ''));
   }
+  if (cmd === '/dashboard') {
+    const d = await dashboard();
+    const src = Object.entries(d.sources).map(([k, v]) => `  ${k}: ${faDigits(v)}`).join('\n');
+    const days = (d.days || []).map(x => `  ${x.day}: ${faDigits(x.c)}`).join('\n');
+    const rec = (d.recent || []).map(u => `  ${u.first_name || '—'}${u.username ? ' @' + u.username : ''}${u.source ? ' (' + u.source + ')' : ''}`).join('\n');
+    return send(chatId, `📊 داشبورد ربات\n\n👥 کل کاربران: ${faDigits(d.users)}\n🆕 امروز (۲۴ ساعت): ${faDigits(d.today)}\n🗓 ۷ روز اخیر: ${faDigits(d.week)}\n📆 ۳۰ روز اخیر: ${faDigits(d.month)}\n\n🟢 فعال ۲۴ ساعت: ${faDigits(d.active24)}\n🟢 فعال ۷ روز: ${faDigits(d.active7)}\n\n🔍 تحلیل‌ها: ${faDigits(d.analyses)}\n📞 درخواست مشاوره: ${faDigits(d.leads)}` + (days ? `\n\nورودی روزانه:\n${days}` : '') + (src ? `\n\nمنبع ورود:\n${src}` : '') + (rec ? `\n\nآخرین کاربران:\n${rec}` : ''));
+  }
   if (cmd === '/leads') {
     const l = await lastLeads();
     return send(chatId, l.length ? '📞 آخرین درخواست‌ها\n\n' + l.map(x => `${x.phone} — ${x.note || x.chat_id}`).join('\n') : 'هنوز درخواستی ثبت نشده.');
@@ -288,7 +317,7 @@ async function onMessage(msg) {
     return showMenu(chatId, msg.from?.first_name);
   }
   await touchUser(msg.from);
-  if (isAdmin(msg.from?.id) && /^\/(stats|leads|broadcast)\b/.test(text)) { if (await adminCommand(chatId, text) !== false) return; }
+  if (isAdmin(msg.from?.id) && /^\/(stats|dashboard|leads|broadcast)\b/.test(text)) { if (await adminCommand(chatId, text) !== false) return; }
   if (text === '/menu' || text === '/help') return showMenu(chatId, msg.from?.first_name);
   if (text === '/plans') return showPlans(chatId);
   if (text === '/analyze') return askAnalyze(chatId);
