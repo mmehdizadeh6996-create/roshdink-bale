@@ -97,13 +97,13 @@ async function dashboard() {
   }
   const base = await stats();
   const t = await pool.query(`SELECT
-    COUNT(*) FILTER (WHERE created_at > now() - interval '1 day')::int today,
-    COUNT(*) FILTER (WHERE created_at > now() - interval '7 days')::int week,
-    COUNT(*) FILTER (WHERE created_at > now() - interval '30 days')::int month,
-    COUNT(*) FILTER (WHERE last_seen > now() - interval '1 day')::int active24,
-    COUNT(*) FILTER (WHERE last_seen > now() - interval '7 days')::int active7
+    COUNT(*) FILTER (WHERE created_at > now() - interval '1 day')::int AS today,
+    COUNT(*) FILTER (WHERE created_at > now() - interval '7 days')::int AS week,
+    COUNT(*) FILTER (WHERE created_at > now() - interval '30 days')::int AS month,
+    COUNT(*) FILTER (WHERE last_seen > now() - interval '1 day')::int AS active24,
+    COUNT(*) FILTER (WHERE last_seen > now() - interval '7 days')::int AS active7
     FROM bale_users`);
-  const d = await pool.query(`SELECT to_char(created_at AT TIME ZONE 'Asia/Tehran','MM/DD') day, COUNT(*)::int c FROM bale_users
+  const d = await pool.query(`SELECT to_char(created_at AT TIME ZONE 'Asia/Tehran','MM/DD') AS day, COUNT(*)::int AS c FROM bale_users
     WHERE created_at > now() - interval '7 days' GROUP BY 1 ORDER BY 1 DESC`);
   const r = await pool.query('SELECT first_name, username, source FROM bale_users ORDER BY created_at DESC LIMIT 5');
   return { ...base, ...t.rows[0], days: d.rows, recent: r.rows };
