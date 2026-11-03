@@ -108,6 +108,35 @@ async function dashboard() {
   const r = await pool.query('SELECT first_name, username, source FROM bale_users ORDER BY created_at DESC LIMIT 5');
   return { ...base, ...t.rows[0], days: d.rows, recent: r.rows };
 }
+/* ---------- بخش‌بندی کاربران (داشبورد) ---------- */
+const tehranDayStart = () => { const t = Date.now() + 12600e3; return Math.floor(t / 864e5) * 864e5 - 12600e3; };
+const SEGMENTS = {
+  all:      { label: '👥 همه‌ی کاربران', sql: 'TRUE', test: () => true },
+  today:    { label: '🆕 امروز', sql: "(created_at AT TIME ZONE 'Asia/Tehran') >= date_trunc('day', now() AT TIME ZONE 'Asia/Tehran')", test: u => u.created >= tehranDayStart() },
+  week:     { label: '🗓 ۷ روز اخیر', sql: "created_at > now() - interval '7 days'", test: u => Date.now() - u.created < 7 * 864e5 },
+  month:    { label: '📆 ۳۰ روز اخیر', sql: "created_at > now() - interval '30 days'", test: u => Date.now() - u.created < 30 * 864e5 },
+  act1:     { label: '🟢 فعال ۲۴ ساعت', sql: "last_seen > now() - interval '1 day'", test: u => Date.now() - (u.last || u.created) < 864e5 },
+  act7:     { label: '🟢 فعال ۷ روز', sql: "last_seen > now() - interval '7 days'", test: u => Date.now() - (u.last || u.created) < 7 * 864e5 },
+  leads:    { label: '📞 درخواست مشاوره', sql: 'chat_id IN (SELECT chat_id FROM bale_leads)', test: u => mem.leads.some(l => l.chat_id === u.id) },
+  analyzed: { label: '🔍 تحلیل گرفته‌ها', sql: 'analyses > 0', test: () => false },
+};
+const memSeg = key => [...mem.users.values()].filter(SEGMENTS[key].test).sort((a, b) => b.created - a.created)
+  .map(u => ({ chat_id: u.id, first_name: u.first_name, username: u.username, source: u.source, created_at: u.created }));
+async function segCounts() {
+  if (!pool) return Object.fromEntries(Object.keys(SEGMENTS).map(k => [k, memSeg(k).length]));
+  const ks = Object.keys(SEGMENTS);
+  const rs = await Promise.all(ks.map(k => pool.query(`SELECT COUNT(*)::int AS c FROM bale_users WHERE ${SEGMENTS[k].sql}`)));
+  return Object.fromEntries(ks.map((k, i) => [k, rs[i].rows[0].c]));
+}
+async function segUsers(key, page, per) {
+  if (!pool) return memSeg(key).slice(page * per, page * per + per);
+  return (await pool.query(`SELECT chat_id, first_name, username, source, created_at FROM bale_users WHERE ${SEGMENTS[key].sql} ORDER BY created_at DESC LIMIT $1 OFFSET $2`, [per, page * per])).rows;
+}
+async function segIds(key) {
+  if (!SEGMENTS[key]) return [];
+  if (!pool) return memSeg(key).map(u => u.chat_id);
+  return (await pool.query(`SELECT chat_id FROM bale_users WHERE ${SEGMENTS[key].sql}`)).rows.map(r => Number(r.chat_id));
+}
 async function lastLeads() {
   if (!pool) return mem.leads.slice(-10).reverse();
   return (await pool.query('SELECT chat_id, phone, note, created_at AS at FROM bale_leads ORDER BY id DESC LIMIT 10')).rows;
@@ -151,7 +180,8 @@ const WELCOME = (name) =>
 /* ---------- وضعیت گفتگو (در حافظه) ---------- */
 const state = new Map();            // chatId -> 'analyze' | 'contact'
 const rate = new Map();             // chatId -> [timestamps]
-const pendingBroadcast = new Map(); // adminId -> text
+const pendingBroadcast = new Map(); // adminId -> { text, seg }
+const adminAwait = new Map();       // adminId -> کلید گروهی که مدیر قرار است برایش پیام بنویسد
 
 function allowAnalyze(chatId) {
   const now = Date.now(), list = (rate.get(chatId) || []).filter(t => now - t < 3600e3);
@@ -259,29 +289,56 @@ async function adminCommand(chatId, text) {
     const src = Object.entries(s.sources).map(([k, v]) => `  ${k}: ${faDigits(v)}`).join('\n');
     return send(chatId, `📈 آمار ربات\nکاربران: ${faDigits(s.users)}\nتحلیل‌ها: ${faDigits(s.analyses)}\nدرخواست مشاوره: ${faDigits(s.leads)}` + (src ? `\n\nمنبع ورود:\n${src}` : ''));
   }
-  if (cmd === '/dashboard') {
-    const d = await dashboard();
-    const src = Object.entries(d.sources).map(([k, v]) => `  ${k}: ${faDigits(v)}`).join('\n');
-    const days = (d.days || []).map(x => `  ${x.day}: ${faDigits(x.c)}`).join('\n');
-    const rec = (d.recent || []).map(u => `  ${u.first_name || '—'}${u.username ? ' @' + u.username : ''}${u.source ? ' (' + u.source + ')' : ''}`).join('\n');
-    return send(chatId, `📊 داشبورد ربات\n\n👥 کل کاربران: ${faDigits(d.users)}\n🆕 امروز (۲۴ ساعت): ${faDigits(d.today)}\n🗓 ۷ روز اخیر: ${faDigits(d.week)}\n📆 ۳۰ روز اخیر: ${faDigits(d.month)}\n\n🟢 فعال ۲۴ ساعت: ${faDigits(d.active24)}\n🟢 فعال ۷ روز: ${faDigits(d.active7)}\n\n🔍 تحلیل‌ها: ${faDigits(d.analyses)}\n📞 درخواست مشاوره: ${faDigits(d.leads)}` + (days ? `\n\nورودی روزانه:\n${days}` : '') + (src ? `\n\nمنبع ورود:\n${src}` : '') + (rec ? `\n\nآخرین کاربران:\n${rec}` : ''));
-  }
+  if (cmd === '/dashboard') return dashboardView(chatId);
   if (cmd === '/leads') {
     const l = await lastLeads();
     return send(chatId, l.length ? '📞 آخرین درخواست‌ها\n\n' + l.map(x => `${x.phone} — ${x.note || x.chat_id}`).join('\n') : 'هنوز درخواستی ثبت نشده.');
   }
   if (cmd === '/broadcast') {
     if (!arg) return send(chatId, 'بعد از دستور، متن تبلیغ را بنویس.\nمثال:\n/broadcast تحلیل رایگان سئوی سایتت: roshdink.ir');
-    pendingBroadcast.set(String(chatId), arg);
+    pendingBroadcast.set(String(chatId), { text: arg, seg: 'all' });
     const n = (await allUserIds()).length;
     return send(chatId, `پیش‌نمایش پیام (برای ${faDigits(n)} نفر):\n\n${arg}`, keyboard([[{ text: '✅ ارسال برای همه', callback_data: 'bc_yes' }, { text: '✖️ لغو', callback_data: 'bc_no' }]]));
   }
   return false;
 }
+async function dashboardView(chatId) {
+  const [d, c] = await Promise.all([dashboard(), segCounts()]);
+  const src = Object.entries(d.sources).map(([k, v]) => `  ${k}: ${faDigits(v)}`).join('\n');
+  const days = (d.days || []).map(x => `  ${x.day}: ${faDigits(x.c)}`).join('\n');
+  const text = `📊 داشبورد ربات\n\n👥 کل کاربران: ${faDigits(c.all)}\n🆕 امروز: ${faDigits(c.today)}\n🗓 ۷ روز اخیر: ${faDigits(c.week)}\n📆 ۳۰ روز اخیر: ${faDigits(c.month)}\n🟢 فعال ۲۴ ساعت: ${faDigits(c.act1)}\n🟢 فعال ۷ روز: ${faDigits(c.act7)}\n\n🔍 تحلیل‌ها: ${faDigits(d.analyses)}\n📞 درخواست مشاوره: ${faDigits(d.leads)}`
+    + (days ? `\n\nورودی روزانه:\n${days}` : '') + (src ? `\n\nمنبع ورود:\n${src}` : '') + '\n\nیک گروه را انتخاب کن تا کاربرانش را ببینی و بتوانی برایشان پیام بفرستی 👇';
+  const b = k => ({ text: `${SEGMENTS[k].label} (${faDigits(c[k] || 0)})`, callback_data: `seg:${k}:0` });
+  return send(chatId, text, keyboard([[b('all'), b('today')], [b('week'), b('month')], [b('act1'), b('act7')], [b('leads'), b('analyzed')]]));
+}
+async function segView(chatId, key, page) {
+  const seg = SEGMENTS[key]; if (!seg) return;
+  const PER = 15, c = await segCounts(), total = c[key] || 0, pages = Math.max(1, Math.ceil(total / PER));
+  page = Math.min(Math.max(0, page), pages - 1);
+  const rows = await segUsers(key, page, PER);
+  const fmt = t => { try { return new Date(t).toLocaleString('fa-IR', { timeZone: 'Asia/Tehran', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }); } catch { return ''; } };
+  const lines = rows.map((u, i) => `${faDigits(page * PER + i + 1)}. ${u.first_name || '—'}${u.username ? ' @' + u.username : ''} · ${fmt(u.created_at)}${u.source ? ' · ' + u.source : ''}`);
+  const nav = [];
+  if (page > 0) nav.push({ text: '◀️ قبلی', callback_data: `seg:${key}:${page - 1}` });
+  if (page < pages - 1) nav.push({ text: 'بعدی ▶️', callback_data: `seg:${key}:${page + 1}` });
+  const kb = [];
+  if (nav.length) kb.push(nav);
+  if (total) kb.push([{ text: `📢 ارسال پیام به این گروه (${faDigits(total)} نفر)`, callback_data: `sbc:${key}` }]);
+  kb.push([{ text: '🔙 داشبورد', callback_data: 'dash' }]);
+  return send(chatId, `${seg.label}\nتعداد: ${faDigits(total)} — صفحه ${faDigits(page + 1)} از ${faDigits(pages)}\n\n` + (lines.length ? lines.join('\n') : 'کاربری در این گروه نیست.'), keyboard(kb));
+}
+async function segBroadcastAsk(chatId, key) {
+  const seg = SEGMENTS[key]; if (!seg) return;
+  const n = (await segIds(key)).length;
+  if (!n) return send(chatId, 'این گروه کاربری ندارد.');
+  adminAwait.set(String(chatId), key);
+  return send(chatId, `متن پیام را برای «${seg.label}» (${faDigits(n)} نفر) بنویس و بفرست.\nبرای انصراف: /cancel`);
+}
 async function doBroadcast(adminId) {
-  const text = pendingBroadcast.get(String(adminId)); pendingBroadcast.delete(String(adminId));
+  const p = pendingBroadcast.get(String(adminId)); pendingBroadcast.delete(String(adminId));
+  const text = p && p.text;
   if (!text) return send(adminId, 'پیامی برای ارسال نیست.');
-  const ids = await allUserIds(); let ok = 0, fail = 0;
+  const ids = await segIds(p.seg || 'all'); let ok = 0, fail = 0;
   await send(adminId, `⏳ ارسال برای ${faDigits(ids.length)} نفر شروع شد…`);
   for (const id of ids) {
     try { await bale('sendMessage', { chat_id: id, text, ...keyboard([[{ text: '🔍 تحلیل رایگان سایت', callback_data: 'analyze' }, { text: '🌐 سایت', url: siteLink('broadcast') }]]) }); ok++; }
@@ -296,6 +353,11 @@ async function onCallback(cb) {
   const chatId = cb.message?.chat?.id || cb.from?.id, data = cb.data;
   bale('answerCallbackQuery', { callback_query_id: cb.id }).catch(() => {});
   await touchUser(cb.from);
+  if (isAdmin(cb.from?.id)) {
+    if (data === 'dash') return dashboardView(chatId);
+    if (data?.startsWith('seg:')) { const [, k, p] = data.split(':'); return segView(chatId, k, parseInt(p, 10) || 0); }
+    if (data?.startsWith('sbc:')) return segBroadcastAsk(chatId, data.slice(4));
+  }
   switch (data) {
     case 'menu': return showMenu(chatId, cb.from?.first_name);
     case 'analyze': return askAnalyze(chatId);
@@ -317,6 +379,16 @@ async function onMessage(msg) {
     return showMenu(chatId, msg.from?.first_name);
   }
   await touchUser(msg.from);
+  if (isAdmin(msg.from?.id) && adminAwait.has(String(chatId))) {
+    const key = adminAwait.get(String(chatId));
+    if (text === '/cancel') { adminAwait.delete(String(chatId)); return send(chatId, 'لغو شد.'); }
+    if (text && !text.startsWith('/')) {
+      adminAwait.delete(String(chatId));
+      pendingBroadcast.set(String(chatId), { text, seg: key });
+      const n = (await segIds(key)).length;
+      return send(chatId, `پیش‌نمایش پیام (برای ${faDigits(n)} نفر از «${SEGMENTS[key].label}»):\n\n${text}`, keyboard([[{ text: '✅ ارسال', callback_data: 'bc_yes' }, { text: '✖️ لغو', callback_data: 'bc_no' }]]));
+    }
+  }
   if (isAdmin(msg.from?.id) && /^\/(stats|dashboard|leads|broadcast)\b/.test(text)) { if (await adminCommand(chatId, text) !== false) return; }
   if (text === '/menu' || text === '/help') return showMenu(chatId, msg.from?.first_name);
   if (text === '/plans') return showPlans(chatId);
