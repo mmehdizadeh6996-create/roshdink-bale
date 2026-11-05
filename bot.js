@@ -1,14 +1,17 @@
-/* ربات بله‌ی رشدینک — معرفی، تحلیل رایگان سایت، پلن‌ها، کد تخفیف، مشاوره و ارسال تبلیغات
+/* ربات رشدینک (بله / تلگرام؛ با PLATFORM انتخاب می‌شود) — معرفی، تحلیل رایگان سایت، پلن‌ها، کد تخفیف، مشاوره و ارسال تبلیغات
  * بدون وابستگی اجباری؛ فقط اگر DATABASE_URL بدهی از pg استفاده می‌کند.
  */
 const http = require('http');
 const crypto = require('crypto');
 
 /* ---------- تنظیمات ---------- */
-const TOKEN = process.env.BALE_BOT_TOKEN || '';
+const PLATFORM = (process.env.PLATFORM || 'bale').toLowerCase() === 'telegram' ? 'telegram' : 'bale';
+const IS_TG = PLATFORM === 'telegram';
+const TOKEN = (IS_TG ? process.env.TELEGRAM_BOT_TOKEN : process.env.BALE_BOT_TOKEN) || process.env.BOT_TOKEN || '';
+const T_USERS = IS_TG ? 'tg_users' : 'bale_users', T_LEADS = IS_TG ? 'tg_leads' : 'bale_leads';
 const SITE_URL = (process.env.SITE_URL || 'https://roshdink.ir').replace(/\/+$/, '');
 const API_BASE = (process.env.API_BASE || SITE_URL).replace(/\/+$/, '');
-const BALE_API_BASE = (process.env.BALE_API_BASE || 'https://tapi.bale.ai').replace(/\/+$/, '');
+const BALE_API_BASE = (IS_TG ? (process.env.TELEGRAM_API_BASE || 'https://api.telegram.org') : (process.env.BALE_API_BASE || 'https://tapi.bale.ai')).replace(/\/+$/, '');
 const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
 const PUBLIC_URL = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
 const MODE = (process.env.BOT_MODE || 'auto').toLowerCase(); // auto | webhook | polling
@@ -16,13 +19,13 @@ const PORT = process.env.PORT || 3000;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || crypto.createHash('sha256').update(TOKEN).digest('hex').slice(0, 24);
 const ANALYZE_LIMIT_PER_HOUR = Number(process.env.ANALYZE_LIMIT_PER_HOUR || 3);
 
-if (!TOKEN) { console.error('BALE_BOT_TOKEN تنظیم نشده است.'); process.exit(1); }
+if (!TOKEN) { console.error((IS_TG ? 'TELEGRAM_BOT_TOKEN' : 'BALE_BOT_TOKEN') + ' تنظیم نشده است.'); process.exit(1); }
 
 /* ---------- ابزارهای کوچک ---------- */
 const faDigits = s => String(s).replace(/\d/g, d => '۰۱۲۳۴۵۶۷۸۹'[d]);
 const fmt = n => faDigits(Number(n).toLocaleString('en-US'));
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const siteLink = (src = 'bale') => `${SITE_URL}/?utm_source=bale&utm_medium=bot&s=${encodeURIComponent(src)}`;
+const siteLink = (src = PLATFORM) => `${SITE_URL}/?utm_source=${PLATFORM}&utm_medium=bot&s=${encodeURIComponent(src)}`;
 const isAdmin = id => ADMIN_IDS.includes(String(id));
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
@@ -46,6 +49,8 @@ async function initStore() {
   if (!process.env.DATABASE_URL) { log('DATABASE_URL ندارد؛ کاربران فقط در حافظه نگه داشته می‌شوند (با ری‌استارت پاک می‌شوند).'); return; }
   const { Pool } = require('pg');
   pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+  const _q = pool.query.bind(pool);   // جدول‌های هر پلتفرم جدا هستند (bale_* یا tg_*)
+  pool.query = (sql, ...a) => _q(typeof sql === 'string' ? sql.replace(/bale_users/g, T_USERS).replace(/bale_leads/g, T_LEADS) : sql, ...a);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS bale_users (
       chat_id BIGINT PRIMARY KEY, first_name VARCHAR(100), username VARCHAR(100), source VARCHAR(60),
