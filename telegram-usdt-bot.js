@@ -88,7 +88,7 @@ async function initStore() {
       txid VARCHAR(80) PRIMARY KEY, from_addr VARCHAR(50), value_micro BIGINT, seen_at TIMESTAMPTZ DEFAULT now()
     );`);
 }
-const q = (sql, params) => pool.query(sql, params);
+const q = (sql, params) => { if (!pool) throw new Error('no database'); return pool.query(sql, params); };
 
 async function touchUser(from, source) {
   if (!from || !pool) return;
@@ -384,7 +384,11 @@ async function onMessage(msg) {
 
 async function handleUpdate(u) {
   try { if (u.callback_query) await onCallback(u.callback_query); else if (u.message) await onMessage(u.message); }
-  catch (e) { log('update error', e.message); }
+  catch (e) {
+    log('update error', e.message);
+    const cid = u.callback_query?.message?.chat?.id || u.message?.chat?.id;
+    if (cid) send(cid, e.message === 'no database' ? 'Payments are temporarily unavailable. Please contact support.' : 'Something went wrong. Please try again in a moment.', keyboard([backRow]));
+  }
 }
 
 /* ---------- run: webhook or polling ---------- */
