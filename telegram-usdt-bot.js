@@ -191,7 +191,6 @@ const mainMenu = () => keyboard([
   [{ text: '🔍 Free site analysis', callback_data: 'analyze' }],
   [{ text: '📦 Plans & pricing', callback_data: 'plans' }, { text: '💳 Buy with USDT', callback_data: 'buy' }],
   [{ text: '👤 My subscription', callback_data: 'mysub' }, { text: '💬 Contact support', callback_data: 'support' }],
-  [{ text: '🌐 Website', url: siteLink('menu') }],
 ]);
 const showMenu = (chatId, name) => { state.delete(chatId); return send(chatId, WELCOME(name), mainMenu()); };
 
@@ -305,7 +304,7 @@ async function doBroadcast(adminId) {
   if (!p) return send(adminId, 'Nothing to send.');
   const ids = await segIds(p.seg); let ok = 0, fail = 0;
   await send(adminId, `⏳ Sending to ${ids.length} users…`);
-  for (const id of ids) { const r = await send(id, p.text, keyboard([[{ text: '🔍 Free site analysis', callback_data: 'analyze' }, { text: '🌐 Website', url: siteLink('broadcast') }]])); r ? ok++ : fail++; await sleep(60); }
+  for (const id of ids) { const r = await send(id, p.text, keyboard([[{ text: '🔍 Free site analysis', callback_data: 'analyze' }]])); r ? ok++ : fail++; await sleep(60); }
   return send(adminId, `✅ Done.\nDelivered: ${ok}\nFailed (e.g. blocked the bot): ${fail}`);
 }
 async function adminCommand(chatId, text) {
