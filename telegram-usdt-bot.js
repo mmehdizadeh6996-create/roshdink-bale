@@ -86,7 +86,12 @@ async function initStore() {
     );
     CREATE TABLE IF NOT EXISTS tg_seen_tx (
       txid VARCHAR(80) PRIMARY KEY, from_addr VARCHAR(50), value_micro BIGINT, seen_at TIMESTAMPTZ DEFAULT now()
-    );`);
+    );
+    CREATE TABLE IF NOT EXISTS tg_tasks (
+      id SERIAL PRIMARY KEY, chat_id BIGINT NOT NULL, order_id INTEGER, title TEXT NOT NULL,
+      status VARCHAR(10) NOT NULL DEFAULT 'todo', updated_at TIMESTAMPTZ DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS tg_tasks_chat ON tg_tasks(chat_id);`);
 }
 const q = (sql, params) => { if (!pool) throw new Error('no database'); return pool.query(sql, params); };
 
@@ -122,13 +127,14 @@ async function activate(order, txid, late) {
        expires_at = GREATEST(tg_subs.expires_at, now()) + ($3 || ' days')::interval
      RETURNING expires_at`, [order.chat_id, order.plan, String(order.months * 30)]);
   const until = new Date(r.rows[0].expires_at).toISOString().slice(0, 10);
+  for (const f of plan.feat) await q('INSERT INTO tg_tasks(chat_id, order_id, title) VALUES($1,$2,$3)', [order.chat_id, order.id, f]);
   pendingSite.set(String(order.chat_id), order.id);
   await send(order.chat_id,
-    `✅ Payment received — your ${plan.name} plan is now active until ${until}.\n\n` +
-    'To get started, reply with your website address (e.g. example.com) and, if you like, a short note about your goals. Our team will contact you here shortly.',
-    keyboard([backRow]));
+    `✅ Payment received — your ${plan.name} plan is now active until ${until}.\n\n📦 What's included:\n` + plan.feat.map(f => '• ' + f).join('\n') + '\n\n' +
+    'To get started, reply with your website address (e.g. example.com) and, if you like, a short note about your goals. Our team will contact you here shortly. You can follow progress any time under 📋 My services.',
+    keyboard([[{ text: '📋 My services', callback_data: 'svc' }], backRow]));
   const u = (await q('SELECT first_name, username FROM tg_users WHERE chat_id=$1', [order.chat_id])).rows[0] || {};
-  await notifyAdmins(`💰 New payment${late ? ' (LATE – order had expired, please double-check)' : ''}\nPlan: ${plan.name} × ${order.months} mo\nAmount: ${usdt(order.amount_micro)} USDT\nUser: ${u.first_name || ''} ${u.username ? '@' + u.username : ''} (${order.chat_id})\nOrder #${order.id}\nTX: ${txid}\nhttps://tronscan.org/#/transaction/${txid}`);
+  await notifyAdmins(`💰 New payment${late ? ' (LATE – order had expired, please double-check)' : ''}\nPlan: ${plan.name} × ${order.months} mo\nAmount: ${usdt(order.amount_micro)} USDT\nUser: ${u.first_name || ''} ${u.username ? '@' + u.username : ''} (${order.chat_id})\nOrder #${order.id}\nTX: ${txid}\nhttps://tronscan.org/#/transaction/${txid}\nManage services: /customer ${order.chat_id}`);
 }
 
 /* ---------- on-chain verification (TronGrid) ---------- */
@@ -190,7 +196,8 @@ const WELCOME = name => `Hi${name ? ' ' + name : ''} 👋\nWelcome to Roshdink.\
 const mainMenu = () => keyboard([
   [{ text: '🔍 Free site analysis', callback_data: 'analyze' }],
   [{ text: '📦 Plans & pricing', callback_data: 'plans' }, { text: '💳 Buy with USDT', callback_data: 'buy' }],
-  [{ text: '👤 My subscription', callback_data: 'mysub' }, { text: '💬 Contact support', callback_data: 'support' }],
+  [{ text: '👤 My subscription', callback_data: 'mysub' }, { text: '📋 My services', callback_data: 'svc' }],
+  [{ text: '💬 Contact support', callback_data: 'support' }],
 ]);
 const showMenu = (chatId, name) => { state.delete(chatId); return send(chatId, WELCOME(name), mainMenu()); };
 
@@ -235,7 +242,17 @@ async function showSub(chatId) {
   if (!pool) return send(chatId, 'Subscriptions are unavailable right now.', keyboard([backRow]));
   const s = (await q('SELECT plan, expires_at FROM tg_subs WHERE chat_id=$1', [chatId])).rows[0];
   if (!s || new Date(s.expires_at) < new Date()) return send(chatId, s ? `Your ${planById(s.plan)?.name || s.plan} plan expired on ${new Date(s.expires_at).toISOString().slice(0, 10)}.` : 'You have no active subscription yet.', keyboard([[{ text: '💳 Buy with USDT', callback_data: 'buy' }], backRow]));
-  return send(chatId, `👤 Your plan: ${planById(s.plan)?.name || s.plan}\n✅ Active until ${new Date(s.expires_at).toISOString().slice(0, 10)}`, keyboard([[{ text: '🔁 Renew / extend', callback_data: 'buy' }], backRow]));
+  return send(chatId, `👤 Your plan: ${planById(s.plan)?.name || s.plan}\n✅ Active until ${new Date(s.expires_at).toISOString().slice(0, 10)}`, keyboard([[{ text: '📋 My services', callback_data: 'svc' }, { text: '🔁 Renew / extend', callback_data: 'buy' }], backRow]));
+}
+
+const TASK_ICON = { todo: '⏳', doing: '🔄', done: '✅' };
+async function showServices(chatId) {
+  if (!pool) return send(chatId, 'Services are unavailable right now.', keyboard([backRow]));
+  const t = (await q('SELECT title, status FROM tg_tasks WHERE chat_id=$1 ORDER BY id DESC LIMIT 40', [chatId])).rows.reverse();
+  if (!t.length) return send(chatId, 'You have no active services yet.', keyboard([[{ text: '💳 Buy with USDT', callback_data: 'buy' }], backRow]));
+  const done = t.filter(x => x.status === 'done').length;
+  return send(chatId, `📋 Your services (${done}/${t.length} completed)\n\n` + t.map(x => `${TASK_ICON[x.status] || '⏳'} ${x.title}`).join('\n') + '\n\n⏳ waiting   🔄 in progress   ✅ done\nQuestions? Use 💬 Contact support.',
+    keyboard([[{ text: '💬 Contact support', callback_data: 'support' }], backRow]));
 }
 
 /* ---------- free site analysis (same API as the website) ---------- */
@@ -249,7 +266,7 @@ const askAnalyze = chatId => { state.set(chatId, 'analyze'); return send(chatId,
 async function runAnalyze(chatId, text) {
   const host = extractHost(text);
   if (!host) return send(chatId, 'That doesn\'t look like a website address 🤔\nTry: example.com', keyboard([backRow]));
-  if (!allowAnalyze(chatId)) { state.delete(chatId); return send(chatId, `To keep the service fast, each person can run ${ANALYZE_LIMIT_PER_HOUR} analyses per hour. Please try again a bit later 🙏`, keyboard([[{ text: '🌐 Analyze on the website', url: siteLink('limit') }], backRow])); }
+  if (!allowAnalyze(chatId)) { state.delete(chatId); return send(chatId, `To keep the service fast, each person can run ${ANALYZE_LIMIT_PER_HOUR} analyses per hour. Please try again a bit later 🙏`, keyboard([backRow])); }
   state.delete(chatId);
   await send(chatId, `⏳ Analyzing ${host}… this usually takes under a minute.`);
   try {
@@ -263,10 +280,10 @@ async function runAnalyze(chatId, text) {
     const issues = (m.topIssues || []).slice(0, 3).map(i => '• ' + i.title).join('\n');
     const out = `📊 Analysis for ${data.host || host}\n\n📱 Mobile\n${icon(ms.performance)} Speed: ${sc(ms.performance)}\n${icon(ms.seo)} SEO: ${sc(ms.seo)}\n${icon(ms.bestPractices)} Best practices: ${sc(ms.bestPractices)}\n${icon(ms.accessibility)} Accessibility: ${sc(ms.accessibility)}\n\n💻 Desktop\n${icon(ds.performance)} Speed: ${sc(ds.performance)}   ${icon(ds.seo)} SEO: ${sc(ds.seo)}\n\n` +
       (issues ? `🔧 Top things to improve:\n${issues}\n\n` : '') + `✅ Suggested plan: ${rec.name}`;
-    return send(chatId, out, keyboard([[{ text: '📦 See plans', callback_data: 'plans' }, { text: '💳 Buy with USDT', callback_data: 'buy' }], [{ text: '🌐 Full report on the website', url: siteLink('analysis') }], backRow]));
+    return send(chatId, out, keyboard([[{ text: '📦 See plans', callback_data: 'plans' }, { text: '💳 Buy with USDT', callback_data: 'buy' }], backRow]));
   } catch (e) {
     log('analyze failed', host, e.message);
-    return send(chatId, 'Couldn\'t analyze that site right now 😕 It may be unreachable or Google\'s service is busy. Please try again in a few minutes.', keyboard([[{ text: '🌐 Analyze on the website', url: siteLink('fail') }], backRow]));
+    return send(chatId, 'Couldn\'t analyze that site right now 😕 It may be unreachable or Google\'s service is busy. Please try again in a few minutes.', keyboard([backRow]));
   }
 }
 
@@ -286,6 +303,7 @@ async function dashboard(chatId) {
   const a = u.rows[0], b = o.rows[0];
   const text = `📊 Dashboard\n\n👥 Users: ${a.total}\n🆕 Today: ${a.today}   🗓 7 days: ${a.week}\n🟢 Active (24h): ${a.active}\n\n✅ Active subscribers: ${s.rows[0].c}\n💰 Paid orders: ${b.paid}   ⏳ Pending: ${b.pending}\n💵 Revenue: ${usdt(b.revenue)} USDT\n\nWallet: ${WALLET_OK ? WALLET : '⚠️ NOT SET'}`;
   return send(chatId, text, keyboard([
+    [{ text: '👥 Customers & services', callback_data: 'adm:cus' }],
     [{ text: '🧾 Recent orders', callback_data: 'adm:orders' }, { text: '✅ Subscribers', callback_data: 'adm:subs' }],
     [{ text: '📢 To all', callback_data: 'adm:bc:all' }, { text: '📢 To today\'s users', callback_data: 'adm:bc:today' }],
     [{ text: '📢 To subscribers', callback_data: 'adm:bc:subs' }, { text: '📢 To never-paid', callback_data: 'adm:bc:free' }]]));
@@ -297,6 +315,27 @@ async function adminLists(chatId, kind) {
   }
   const r = (await q('SELECT s.chat_id, s.plan, s.expires_at, u.username, u.first_name FROM tg_subs s LEFT JOIN tg_users u USING(chat_id) WHERE s.expires_at > now() ORDER BY s.expires_at LIMIT 30')).rows;
   return send(chatId, r.length ? '✅ Active subscribers (soonest expiry first)\n\n' + r.map(x => `${x.username ? '@' + x.username : x.first_name || x.chat_id} · ${x.plan} · until ${new Date(x.expires_at).toISOString().slice(0, 10)}`).join('\n') : 'No active subscribers.', keyboard([[{ text: '🔙 Dashboard', callback_data: 'adm:dash' }]]));
+}
+async function adminCustomers(chatId) {
+  const r = (await q("SELECT s.chat_id, s.plan, s.expires_at, u.username, u.first_name, (SELECT COUNT(*) FROM tg_tasks t WHERE t.chat_id=s.chat_id AND t.status='done')::int AS done, (SELECT COUNT(*) FROM tg_tasks t WHERE t.chat_id=s.chat_id)::int AS total FROM tg_subs s LEFT JOIN tg_users u USING(chat_id) WHERE s.expires_at > now() ORDER BY s.expires_at LIMIT 20")).rows;
+  if (!r.length) return send(chatId, 'No active customers yet.', keyboard([[{ text: '🔙 Dashboard', callback_data: 'adm:dash' }]]));
+  return send(chatId, '👥 Active customers — tap one to manage their services',
+    keyboard([...r.map(x => [{ text: `${x.username ? '@' + x.username : x.first_name || x.chat_id} · ${x.plan} · ${x.done}/${x.total} done`, callback_data: `adm:c:${x.chat_id}` }]), [{ text: '🔙 Dashboard', callback_data: 'adm:dash' }]]));
+}
+async function adminCustomer(chatId, cid) {
+  const s = (await q('SELECT s.plan, s.expires_at, u.username, u.first_name FROM tg_subs s LEFT JOIN tg_users u USING(chat_id) WHERE s.chat_id=$1', [cid])).rows[0];
+  if (!s) return send(chatId, 'That customer has no subscription.');
+  const t = (await q('SELECT id, title, status FROM tg_tasks WHERE chat_id=$1 ORDER BY id DESC LIMIT 40', [cid])).rows.reverse();
+  return send(chatId, `👤 ${s.first_name || ''} ${s.username ? '@' + s.username : ''} (${cid})\nPlan: ${s.plan} · until ${new Date(s.expires_at).toISOString().slice(0, 10)}\n\nTap a service to change its status (⏳ → 🔄 → ✅). The customer is notified.\nMessage them: /reply ${cid} <text>`,
+    keyboard([...t.map(x => [{ text: `${TASK_ICON[x.status] || '⏳'} ${String(x.title).slice(0, 50)}`, callback_data: `adm:t:${x.id}` }]), [{ text: '🔙 Customers', callback_data: 'adm:cus' }]]));
+}
+async function adminTask(chatId, id) {
+  const x = (await q("UPDATE tg_tasks SET status = CASE status WHEN 'todo' THEN 'doing' WHEN 'doing' THEN 'done' ELSE 'todo' END, updated_at = now() WHERE id=$1 RETURNING *", [id])).rows[0];
+  if (!x) return;
+  const btn = keyboard([[{ text: '📋 My services', callback_data: 'svc' }]]);
+  if (x.status === 'doing') send(x.chat_id, `🔄 Update: “${x.title}” is now in progress.`, btn);
+  if (x.status === 'done') send(x.chat_id, `✅ Done: “${x.title}” is complete.`, btn);
+  return adminCustomer(chatId, x.chat_id);
 }
 const segIds = async key => (SEGMENTS[key] ? (await q(`SELECT chat_id FROM tg_users WHERE ${SEGMENTS[key].sql}`)).rows.map(r => Number(r.chat_id)) : []);
 async function doBroadcast(adminId) {
@@ -311,6 +350,8 @@ async function adminCommand(chatId, text) {
   const [cmd, ...rest] = text.split(/\s+/);
   if (cmd === '/dashboard' || cmd === '/stats') return dashboard(chatId);
   if (cmd === '/orders') return adminLists(chatId, 'orders');
+  if (cmd === '/customers') return adminCustomers(chatId);
+  if (cmd === '/customer') return /^\d+$/.test(rest[0] || '') ? adminCustomer(chatId, rest[0]) : send(chatId, 'Usage: /customer <chat_id>');
   if (cmd === '/check') { const n = await checkPayments(); return send(chatId, `Checked the chain. Matched payments: ${n}`); }
   if (cmd === '/activate') {            // /activate <chat_id> <plan> <months>   (manual fallback)
     const [id, planId, m] = rest, plan = planById(planId), months = Number(m || 1);
@@ -330,6 +371,9 @@ async function onCallback(cb) {
   if (isAdmin(cb.from?.id)) {
     if (data === 'adm:dash') return dashboard(chatId);
     if (data === 'adm:orders') return adminLists(chatId, 'orders');
+    if (data === 'adm:cus') return adminCustomers(chatId);
+    if (data.startsWith('adm:c:')) return adminCustomer(chatId, data.slice(6));
+    if (data.startsWith('adm:t:')) return adminTask(chatId, Number(data.slice(6)));
     if (data === 'adm:subs') return adminLists(chatId, 'subs');
     if (data.startsWith('adm:bc:')) { const key = data.slice(7); if (!SEGMENTS[key]) return; const n = (await segIds(key)).length; if (!n) return send(chatId, 'That group is empty.'); adminAwait.set(String(chatId), key); return send(chatId, `Write the message for “${SEGMENTS[key].label}” (${n} users) and send it.\nTo cancel: /cancel`); }
     if (data === 'bc_yes') return doBroadcast(cb.from.id);
@@ -340,6 +384,7 @@ async function onCallback(cb) {
   if (data === 'plans') return showPlans(chatId);
   if (data === 'buy') return showBuy(chatId);
   if (data === 'mysub') return showSub(chatId);
+  if (data === 'svc') return showServices(chatId);
   if (data === 'support') { state.set(chatId, 'support'); return send(chatId, 'Write your message and our team will reply here.', keyboard([backRow])); }
   if (data.startsWith('p:')) return showDuration(chatId, data.slice(2));
   if (data.startsWith('d:')) { const [, pid, m] = data.split(':'); return startOrder(chatId, pid, Number(m)); }
@@ -359,7 +404,7 @@ async function onMessage(msg) {
       if (text === '/cancel') { adminAwait.delete(String(chatId)); return send(chatId, 'Cancelled.'); }
       if (text && !text.startsWith('/')) { adminAwait.delete(String(chatId)); pendingBroadcast.set(String(chatId), { text, seg: key }); const n = (await segIds(key)).length; return send(chatId, `Preview (to ${n} users, “${SEGMENTS[key].label}”):\n\n${text}`, keyboard([[{ text: '✅ Send', callback_data: 'bc_yes' }, { text: '✖️ Cancel', callback_data: 'bc_no' }]])); }
     }
-    if (/^\/(dashboard|stats|orders|check|activate)\b/.test(text)) { if (await adminCommand(chatId, text) !== false) return; }
+    if (/^\/(dashboard|stats|orders|customers|customer|check|activate)\b/.test(text)) { if (await adminCommand(chatId, text) !== false) return; }
     // admin replies to a forwarded customer message: "/reply <chat_id> text"
     const m = text.match(/^\/reply\s+(\d+)\s+([\s\S]+)/); if (m) { await send(m[1], m[2]); return send(chatId, 'Sent.'); }
   }
