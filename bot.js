@@ -4,6 +4,9 @@
 const http = require('http');
 const crypto = require('crypto');
 
+/* Telegram = English bot with USDT payments (separate file) */
+if ((process.env.PLATFORM || '').toLowerCase() === 'telegram') { require('./telegram-usdt-bot.js'); return; }
+
 /* ---------- تنظیمات ---------- */
 const PLATFORM = (process.env.PLATFORM || 'bale').toLowerCase() === 'telegram' ? 'telegram' : 'bale';
 const IS_TG = PLATFORM === 'telegram';
