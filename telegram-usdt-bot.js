@@ -91,7 +91,8 @@ async function initStore() {
       id SERIAL PRIMARY KEY, chat_id BIGINT NOT NULL, order_id INTEGER, title TEXT NOT NULL,
       status VARCHAR(10) NOT NULL DEFAULT 'todo', updated_at TIMESTAMPTZ DEFAULT now()
     );
-    CREATE INDEX IF NOT EXISTS tg_tasks_chat ON tg_tasks(chat_id);`);
+    CREATE INDEX IF NOT EXISTS tg_tasks_chat ON tg_tasks(chat_id);
+    ALTER TABLE tg_orders ADD COLUMN IF NOT EXISTS test BOOLEAN NOT NULL DEFAULT false;`);
 }
 const q = (sql, params) => { if (!pool) throw new Error('no database'); return pool.query(sql, params); };
 
@@ -104,15 +105,15 @@ async function touchUser(from, source) {
 }
 
 /* ---------- orders & activation ---------- */
-async function createOrder(chatId, plan, months) {
-  const base = Math.round(priceFor(plan, months) * 1e6);          // micro-USDT
+async function createOrder(chatId, plan, months, test = false) {
+  const base = test ? 0 : Math.round(priceFor(plan, months) * 1e6);          // micro-USDT
   for (let i = 0; i < 40; i++) {
     const amount = base + (1 + Math.floor(Math.random() * 999)) * 1000; // +0.001 … +0.999 USDT, unique per pending order
     try {
       await q("UPDATE tg_orders SET status='expired' WHERE chat_id=$1 AND status='pending'", [chatId]); // one open order per user
       const r = await q(
-        `INSERT INTO tg_orders(chat_id, plan, months, amount_micro, expires_at) VALUES($1,$2,$3,$4, now() + ($5 || ' minutes')::interval) RETURNING *`,
-        [chatId, plan.id, months, amount, String(ORDER_TTL_MIN)]);
+        `INSERT INTO tg_orders(chat_id, plan, months, amount_micro, expires_at, test) VALUES($1,$2,$3,$4, now() + ($5 || ' minutes')::interval, $6) RETURNING *`,
+        [chatId, plan.id, months, amount, String(ORDER_TTL_MIN), test]);
       return r.rows[0];
     } catch (e) { if (e.code !== '23505') throw e; }                 // amount already used by another pending order → retry
   }
@@ -134,7 +135,7 @@ async function activate(order, txid, late) {
     'To get started, reply with your website address (e.g. example.com) and, if you like, a short note about your goals. Our team will contact you here shortly. You can follow progress any time under 📋 My services.',
     keyboard([[{ text: '📋 My services', callback_data: 'svc' }], backRow]));
   const u = (await q('SELECT first_name, username FROM tg_users WHERE chat_id=$1', [order.chat_id])).rows[0] || {};
-  await notifyAdmins(`💰 New payment${late ? ' (LATE – order had expired, please double-check)' : ''}\nPlan: ${plan.name} × ${order.months} mo\nAmount: ${usdt(order.amount_micro)} USDT\nUser: ${u.first_name || ''} ${u.username ? '@' + u.username : ''} (${order.chat_id})\nOrder #${order.id}\nTX: ${txid}\nhttps://tronscan.org/#/transaction/${txid}\nManage services: /customer ${order.chat_id}`);
+  await notifyAdmins(`💰 ${order.test ? '🧪 TEST ' : ''}New payment${late ? ' (LATE – order had expired, please double-check)' : ''}\nPlan: ${plan.name} × ${order.months} mo\nAmount: ${usdt(order.amount_micro)} USDT\nUser: ${u.first_name || ''} ${u.username ? '@' + u.username : ''} (${order.chat_id})\nOrder #${order.id}\nTX: ${txid}\nhttps://tronscan.org/#/transaction/${txid}\nManage services: /customer ${order.chat_id}`);
 }
 
 /* ---------- on-chain verification (TronGrid) ---------- */
@@ -216,14 +217,14 @@ async function showDuration(chatId, planId) {
     [{ text: `3 months — ${priceFor(p, 3)} USDT (save 15%)`, callback_data: `d:${p.id}:3` }],
     [{ text: '⬅️ Back', callback_data: 'buy' }]]));
 }
-async function startOrder(chatId, planId, months) {
-  const p = planById(planId); if (!p || ![1, 3].includes(months) || !pool || !WALLET_OK) return;
-  const o = await createOrder(chatId, p, months);
-  const text = `🧾 <b>Order #${o.id}</b> — ${esc(p.name)} × ${months} month${months > 1 ? 's' : ''}\n\n` +
-    `Send exactly:\n<code>${usdt(o.amount_micro)}</code> USDT\n\nNetwork: <b>TRON (TRC-20)</b> only\nTo address:\n<code>${WALLET}</code>\n\n` +
+async function startOrder(chatId, planId, months, test = false) {
+  const p = planById(planId); if (!p || ![1, 3].includes(months) || !pool || (!WALLET_OK && !test)) return;
+  const o = await createOrder(chatId, p, months, test);
+  const text = `🧾 <b>${test ? '🧪 TEST ' : ''}Order #${o.id}</b> — ${esc(p.name)} × ${months} month${months > 1 ? 's' : ''}\n\n` +
+    `Send exactly:\n<code>${usdt(o.amount_micro)}</code> USDT\n\nNetwork: <b>TRON (TRC-20)</b> only\nTo address:\n<code>${WALLET_OK ? WALLET : 'TEST-MODE'}</code>\n\n` +
     `⚠️ The amount must match <b>exactly</b> (all decimals) — that's how we recognise your payment. Other networks or amounts can't be matched automatically.\n` +
     `⏳ Valid for ${ORDER_TTL_MIN} minutes. Your plan activates automatically about a minute after the transfer is confirmed.`;
-  return send(chatId, text, { parse_mode: 'HTML', ...keyboard([[{ text: '✅ I\'ve paid — check now', callback_data: `chk:${o.id}` }], [{ text: '✖️ Cancel order', callback_data: `can:${o.id}` }]]) });
+  return send(chatId, text, { parse_mode: 'HTML', ...keyboard([...(test ? [[{ text: '🧪 Simulate payment (test)', callback_data: `tst:${o.id}` }]] : []), [{ text: '✅ I\'ve paid — check now', callback_data: `chk:${o.id}` }], [{ text: '✖️ Cancel order', callback_data: `can:${o.id}` }]]) });
 }
 async function checkOrder(chatId, id) {
   const o = (await q('SELECT * FROM tg_orders WHERE id=$1 AND chat_id=$2', [id, chatId])).rows[0];
@@ -298,7 +299,7 @@ async function dashboard(chatId) {
   if (!pool) return send(chatId, 'No database connected.');
   const [u, o, s] = await Promise.all([
     q(`SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE created_at > now() - interval '1 day')::int AS today, COUNT(*) FILTER (WHERE created_at > now() - interval '7 days')::int AS week, COUNT(*) FILTER (WHERE last_seen > now() - interval '1 day')::int AS active FROM tg_users`),
-    q("SELECT COUNT(*) FILTER (WHERE status='paid')::int AS paid, COUNT(*) FILTER (WHERE status='pending')::int AS pending, COALESCE(SUM(amount_micro) FILTER (WHERE status='paid'),0)::bigint AS revenue FROM tg_orders"),
+    q("SELECT COUNT(*) FILTER (WHERE status='paid' AND NOT test)::int AS paid, COUNT(*) FILTER (WHERE status='pending')::int AS pending, COALESCE(SUM(amount_micro) FILTER (WHERE status='paid' AND NOT test),0)::bigint AS revenue FROM tg_orders"),
     q('SELECT COUNT(*)::int AS c FROM tg_subs WHERE expires_at > now()')]);
   const a = u.rows[0], b = o.rows[0];
   const text = `📊 Dashboard\n\n👥 Users: ${a.total}\n🆕 Today: ${a.today}   🗓 7 days: ${a.week}\n🟢 Active (24h): ${a.active}\n\n✅ Active subscribers: ${s.rows[0].c}\n💰 Paid orders: ${b.paid}   ⏳ Pending: ${b.pending}\n💵 Revenue: ${usdt(b.revenue)} USDT\n\nWallet: ${WALLET_OK ? WALLET : '⚠️ NOT SET'}`;
@@ -349,6 +350,17 @@ async function doBroadcast(adminId) {
 async function adminCommand(chatId, text) {
   const [cmd, ...rest] = text.split(/\s+/);
   if (cmd === '/dashboard' || cmd === '/stats') return dashboard(chatId);
+  if (cmd === '/testpay') {              // free end-to-end test: simulates a confirmed payment for the admin
+    const plan = planById(rest[0] || 'growth');
+    if (!plan) return send(chatId, 'Usage: /testpay [start|growth|scale]');
+    return startOrder(chatId, plan.id, 1, true);
+  }
+  if (cmd === '/testreset') {            // removes the admin's own test data so the test can be repeated
+    const real = (await q("SELECT COUNT(*)::int AS c FROM tg_orders WHERE chat_id=$1 AND status='paid' AND NOT test", [chatId])).rows[0].c;
+    if (real) return send(chatId, 'Your account has a real paid order, so I did not reset anything.');
+    await q('DELETE FROM tg_tasks WHERE chat_id=$1', [chatId]); await q('DELETE FROM tg_subs WHERE chat_id=$1', [chatId]); await q('DELETE FROM tg_orders WHERE chat_id=$1 AND test', [chatId]);
+    return send(chatId, '🧹 Test data removed. Run /testpay again to repeat the test.');
+  }
   if (cmd === '/orders') return adminLists(chatId, 'orders');
   if (cmd === '/customers') return adminCustomers(chatId);
   if (cmd === '/customer') return /^\d+$/.test(rest[0] || '') ? adminCustomer(chatId, rest[0]) : send(chatId, 'Usage: /customer <chat_id>');
@@ -370,6 +382,12 @@ async function onCallback(cb) {
   await touchUser(cb.from);
   if (isAdmin(cb.from?.id)) {
     if (data === 'adm:dash') return dashboard(chatId);
+    if (data.startsWith('tst:')) {
+      const id = Number(data.slice(4));
+      const o = (await q("UPDATE tg_orders SET status='paid', txid=$2, paid_at=now() WHERE id=$1 AND test AND chat_id=$3 AND status='pending' RETURNING *", [id, 'test-' + id + '-' + Date.now(), cb.from.id])).rows[0];
+      if (!o) return send(chatId, 'Test order not found, expired, or already processed. Run /testpay again.');
+      return activate(o, o.txid, false);
+    }
     if (data === 'adm:orders') return adminLists(chatId, 'orders');
     if (data === 'adm:cus') return adminCustomers(chatId);
     if (data.startsWith('adm:c:')) return adminCustomer(chatId, data.slice(6));
@@ -404,7 +422,7 @@ async function onMessage(msg) {
       if (text === '/cancel') { adminAwait.delete(String(chatId)); return send(chatId, 'Cancelled.'); }
       if (text && !text.startsWith('/')) { adminAwait.delete(String(chatId)); pendingBroadcast.set(String(chatId), { text, seg: key }); const n = (await segIds(key)).length; return send(chatId, `Preview (to ${n} users, “${SEGMENTS[key].label}”):\n\n${text}`, keyboard([[{ text: '✅ Send', callback_data: 'bc_yes' }, { text: '✖️ Cancel', callback_data: 'bc_no' }]])); }
     }
-    if (/^\/(dashboard|stats|orders|customers|customer|check|activate)\b/.test(text)) { if (await adminCommand(chatId, text) !== false) return; }
+    if (/^\/(dashboard|stats|orders|customers|customer|check|activate|testpay|testreset)\b/.test(text)) { if (await adminCommand(chatId, text) !== false) return; }
     // admin replies to a forwarded customer message: "/reply <chat_id> text"
     const m = text.match(/^\/reply\s+(\d+)\s+([\s\S]+)/); if (m) { await send(m[1], m[2]); return send(chatId, 'Sent.'); }
   }
