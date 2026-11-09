@@ -33,6 +33,10 @@ if (!TOKEN) { console.error('TELEGRAM_BOT_TOKEN is not set.'); process.exit(1); 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const isAdmin = id => ADMIN_IDS.includes(String(id));
+const NUM_ADMINS = ADMIN_IDS.filter(x => /^\d+$/.test(x));
+const NOT_ADMIN = NUM_ADMINS.length ? `chat_id NOT IN (${NUM_ADMINS.join(',')})` : 'TRUE';
+const FU_ON = (process.env.FOLLOWUPS || 'on').toLowerCase() !== 'off';
+const FU_ANALYSIS_H = Number(process.env.FU_ANALYSIS_HOURS || 24), FU_ORDER_H = Number(process.env.FU_ORDER_HOURS || 2), FU_TICK = Math.max(5, Number(process.env.FU_TICK_SEC || 600));
 const esc = s => String(s ?? '').replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 const siteLink = (src = 'bot') => `${SITE_URL}/?utm_source=telegram&utm_medium=bot&s=${encodeURIComponent(src)}`;
 const usdt = micro => (Number(micro) / 1e6).toFixed(3);
@@ -60,7 +64,9 @@ const PLANS = [
   { id: 'scale', name: 'Scale', price: Number(process.env.PRICE_SCALE || 599), tag: 'For market leaders',
     feat: ['Everything in Growth', 'Dedicated SEO & content team', '20 articles + landing page design', 'Conversion rate optimization (CRO)', 'Competitor analysis & live dashboard', 'Dedicated growth manager, same-day replies'] },
 ];
-const planById = id => PLANS.find(p => p.id === id);
+const AUDIT = { id: 'audit', name: 'SEO Audit', price: Number(process.env.PRICE_AUDIT || 19), tag: 'One-time, no subscription',
+  feat: ['Full technical SEO audit of your website', 'Prioritized fix list (PDF report)', 'Top 10 keyword opportunities', 'Delivered within 48 hours'] };
+const planById = id => (id === 'audit' ? AUDIT : PLANS.find(p => p.id === id));
 const priceFor = (plan, months) => (months === 3 ? Math.round(plan.price * 3 * 0.85 * 1000) / 1000 : plan.price);
 
 /* ---------- storage (Postgres is required for payments) ---------- */
@@ -92,7 +98,14 @@ async function initStore() {
       status VARCHAR(10) NOT NULL DEFAULT 'todo', updated_at TIMESTAMPTZ DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS tg_tasks_chat ON tg_tasks(chat_id);
-    ALTER TABLE tg_orders ADD COLUMN IF NOT EXISTS test BOOLEAN NOT NULL DEFAULT false;`);
+    ALTER TABLE tg_orders ADD COLUMN IF NOT EXISTS test BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE tg_orders ADD COLUMN IF NOT EXISTS followup_at TIMESTAMPTZ;
+    ALTER TABLE tg_users ADD COLUMN IF NOT EXISTS analyzed_at TIMESTAMPTZ;
+    ALTER TABLE tg_users ADD COLUMN IF NOT EXISTS last_domain TEXT;
+    ALTER TABLE tg_users ADD COLUMN IF NOT EXISTS last_score INTEGER;
+    ALTER TABLE tg_users ADD COLUMN IF NOT EXISTS last_issues TEXT;
+    ALTER TABLE tg_users ADD COLUMN IF NOT EXISTS followup1_at TIMESTAMPTZ;
+    ALTER TABLE tg_users ADD COLUMN IF NOT EXISTS unsubscribed BOOLEAN NOT NULL DEFAULT false;`);
 }
 const q = (sql, params) => { if (!pool) throw new Error('no database'); return pool.query(sql, params); };
 
@@ -100,7 +113,7 @@ async function touchUser(from, source) {
   if (!from || !pool) return;
   await q(
     `INSERT INTO tg_users(chat_id, first_name, username, source) VALUES($1,$2,$3,$4)
-     ON CONFLICT (chat_id) DO UPDATE SET last_seen = now(), first_name = EXCLUDED.first_name, username = EXCLUDED.username`,
+     ON CONFLICT (chat_id) DO UPDATE SET last_seen = now(), first_name = EXCLUDED.first_name, username = EXCLUDED.username, source = COALESCE(tg_users.source, EXCLUDED.source)`,
     [from.id, (from.first_name || '').slice(0, 100), (from.username || '').slice(0, 100), source || null]).catch(e => log('touchUser', e.message));
 }
 
@@ -122,20 +135,24 @@ async function createOrder(chatId, plan, months, test = false) {
 
 async function activate(order, txid, late) {
   const plan = planById(order.plan);
-  const r = await q(
-    `INSERT INTO tg_subs(chat_id, plan, expires_at) VALUES($1,$2, now() + ($3 || ' days')::interval)
-     ON CONFLICT (chat_id) DO UPDATE SET plan = EXCLUDED.plan, updated_at = now(),
-       expires_at = GREATEST(tg_subs.expires_at, now()) + ($3 || ' days')::interval
-     RETURNING expires_at`, [order.chat_id, order.plan, String(order.months * 30)]);
-  const until = new Date(r.rows[0].expires_at).toISOString().slice(0, 10);
+  const isAudit = order.plan === 'audit';
+  let until = '';
+  if (!isAudit) {
+    const r = await q(
+      `INSERT INTO tg_subs(chat_id, plan, expires_at) VALUES($1,$2, now() + ($3 || ' days')::interval)
+       ON CONFLICT (chat_id) DO UPDATE SET plan = EXCLUDED.plan, updated_at = now(),
+         expires_at = GREATEST(tg_subs.expires_at, now()) + ($3 || ' days')::interval
+       RETURNING expires_at`, [order.chat_id, order.plan, String(order.months * 30)]);
+    until = new Date(r.rows[0].expires_at).toISOString().slice(0, 10);
+  }
   for (const f of plan.feat) await q('INSERT INTO tg_tasks(chat_id, order_id, title) VALUES($1,$2,$3)', [order.chat_id, order.id, f]);
   pendingSite.set(String(order.chat_id), order.id);
   await send(order.chat_id,
-    `✅ Payment received — your ${plan.name} plan is now active until ${until}.\n\n📦 What's included:\n` + plan.feat.map(f => '• ' + f).join('\n') + '\n\n' +
-    'To get started, reply with your website address (e.g. example.com) and, if you like, a short note about your goals. Our team will contact you here shortly. You can follow progress any time under 📋 My services.',
+    (isAudit ? `✅ Payment received — your ${plan.name} is confirmed.\n\n📦 What's included:\n` : `✅ Payment received — your ${plan.name} plan is now active until ${until}.\n\n📦 What's included:\n`) + plan.feat.map(f => '• ' + f).join('\n') + '\n\n' +
+    (isAudit ? 'Reply with the website address you want audited (e.g. example.com) and any goals or competitors to consider. Your report will be delivered here within 48 hours. ' : 'To get started, reply with your website address (e.g. example.com) and, if you like, a short note about your goals. Our team will contact you here shortly. ') + 'You can follow progress any time under 📋 My services.',
     keyboard([[{ text: '📋 My services', callback_data: 'svc' }], backRow]));
   const u = (await q('SELECT first_name, username FROM tg_users WHERE chat_id=$1', [order.chat_id])).rows[0] || {};
-  await notifyAdmins(`💰 ${order.test ? '🧪 TEST ' : ''}New payment${late ? ' (LATE – order had expired, please double-check)' : ''}\nPlan: ${plan.name} × ${order.months} mo\nAmount: ${usdt(order.amount_micro)} USDT\nUser: ${u.first_name || ''} ${u.username ? '@' + u.username : ''} (${order.chat_id})\nOrder #${order.id}\nTX: ${txid}\nhttps://tronscan.org/#/transaction/${txid}\nManage services: /customer ${order.chat_id}`);
+  await notifyAdmins(`💰 ${order.test ? '🧪 TEST ' : ''}New payment${late ? ' (LATE – order had expired, please double-check)' : ''}\nPlan: ${plan.name}${isAudit ? ' (one-time)' : ' × ' + order.months + ' mo'}\nAmount: ${usdt(order.amount_micro)} USDT\nUser: ${u.first_name || ''} ${u.username ? '@' + u.username : ''} (${order.chat_id})\nOrder #${order.id}\nTX: ${txid}\nhttps://tronscan.org/#/transaction/${txid}\nManage services: /customer ${order.chat_id}`);
 }
 
 /* ---------- on-chain verification (TronGrid) ---------- */
@@ -203,12 +220,13 @@ const mainMenu = () => keyboard([
 const showMenu = (chatId, name) => { state.delete(chatId); return send(chatId, WELCOME(name), mainMenu()); };
 
 const planText = p => `📦 ${p.name} plan — ${p.tag}\n💰 ${p.price} USDT / month\n` + p.feat.map(f => '• ' + f).join('\n');
-const showPlans = chatId => send(chatId, PLANS.map(planText).join('\n\n──────────\n\n') + '\n\n✨ Pay for 3 months and save 15%.',
-  keyboard([[{ text: '💳 Buy with USDT', callback_data: 'buy' }], backRow]));
+const auditText = `🎯 ${AUDIT.name} — ${AUDIT.tag}\n💰 ${AUDIT.price} USDT (one-time)\n` + AUDIT.feat.map(f => '• ' + f).join('\n');
+const showPlans = chatId => send(chatId, [auditText, ...PLANS.map(planText)].join('\n\n──────────\n\n') + '\n\n✨ Pay for 3 months and save 15%.',
+  keyboard([[{ text: `🎯 Get the SEO Audit — ${AUDIT.price} USDT`, callback_data: 'd:audit:1' }], [{ text: '💳 Buy a plan with USDT', callback_data: 'buy' }], backRow]));
 
 async function showBuy(chatId) {
   if (!pool || !WALLET_OK) return send(chatId, 'Payments are temporarily unavailable. Please contact support.', keyboard([[{ text: '💬 Contact support', callback_data: 'support' }], backRow]));
-  return send(chatId, 'Choose a plan:', keyboard([...PLANS.map(p => [{ text: `${p.name} — ${p.price} USDT/mo`, callback_data: `p:${p.id}` }]), backRow]));
+  return send(chatId, 'Choose what you need:', keyboard([[{ text: `🎯 SEO Audit — ${AUDIT.price} USDT (one-time)`, callback_data: 'd:audit:1' }], ...PLANS.map(p => [{ text: `${p.name} — ${p.price} USDT/mo`, callback_data: `p:${p.id}` }]), backRow]));
 }
 async function showDuration(chatId, planId) {
   const p = planById(planId); if (!p) return;
@@ -220,10 +238,10 @@ async function showDuration(chatId, planId) {
 async function startOrder(chatId, planId, months, test = false) {
   const p = planById(planId); if (!p || ![1, 3].includes(months) || !pool || (!WALLET_OK && !test)) return;
   const o = await createOrder(chatId, p, months, test);
-  const text = `🧾 <b>${test ? '🧪 TEST ' : ''}Order #${o.id}</b> — ${esc(p.name)} × ${months} month${months > 1 ? 's' : ''}\n\n` +
+  const text = `🧾 <b>${test ? '🧪 TEST ' : ''}Order #${o.id}</b> — ${esc(p.name)} ${p.id === 'audit' ? '(one-time)' : '× ' + months + ' month' + (months > 1 ? 's' : '')}\n\n` +
     `Send exactly:\n<code>${usdt(o.amount_micro)}</code> USDT\n\nNetwork: <b>TRON (TRC-20)</b> only\nTo address:\n<code>${WALLET_OK ? WALLET : 'TEST-MODE'}</code>\n\n` +
     `⚠️ The amount must match <b>exactly</b> (all decimals) — that's how we recognise your payment. Other networks or amounts can't be matched automatically.\n` +
-    `⏳ Valid for ${ORDER_TTL_MIN} minutes. Your plan activates automatically about a minute after the transfer is confirmed.`;
+    `⏳ Valid for ${ORDER_TTL_MIN} minutes. Your order activates automatically about a minute after the transfer is confirmed.`;
   return send(chatId, text, { parse_mode: 'HTML', ...keyboard([...(test ? [[{ text: '🧪 Simulate payment (test)', callback_data: `tst:${o.id}` }]] : []), [{ text: '✅ I\'ve paid — check now', callback_data: `chk:${o.id}` }], [{ text: '✖️ Cancel order', callback_data: `can:${o.id}` }]]) });
 }
 async function checkOrder(chatId, id) {
@@ -281,10 +299,53 @@ async function runAnalyze(chatId, text) {
     const issues = (m.topIssues || []).slice(0, 3).map(i => '• ' + i.title).join('\n');
     const out = `📊 Analysis for ${data.host || host}\n\n📱 Mobile\n${icon(ms.performance)} Speed: ${sc(ms.performance)}\n${icon(ms.seo)} SEO: ${sc(ms.seo)}\n${icon(ms.bestPractices)} Best practices: ${sc(ms.bestPractices)}\n${icon(ms.accessibility)} Accessibility: ${sc(ms.accessibility)}\n\n💻 Desktop\n${icon(ds.performance)} Speed: ${sc(ds.performance)}   ${icon(ds.seo)} SEO: ${sc(ds.seo)}\n\n` +
       (issues ? `🔧 Top things to improve:\n${issues}\n\n` : '') + `✅ Suggested plan: ${rec.name}`;
-    return send(chatId, out, keyboard([[{ text: '📦 See plans', callback_data: 'plans' }, { text: '💳 Buy with USDT', callback_data: 'buy' }], backRow]));
+    if (pool) await q('UPDATE tg_users SET analyzed_at = now(), last_domain = $2, last_score = $3, last_issues = $4, followup1_at = NULL WHERE chat_id = $1', [chatId, data.host || host, overall, (m.topIssues || []).slice(0, 3).map(i => i.title).join(' | ')]).catch(e => log('save analysis', e.message));
+    return send(chatId, out, keyboard([[{ text: `🎯 Full SEO Audit — ${AUDIT.price} USDT`, callback_data: 'd:audit:1' }], [{ text: '📦 See plans', callback_data: 'plans' }, { text: '💳 Buy with USDT', callback_data: 'buy' }], backRow]));
   } catch (e) {
     log('analyze failed', host, e.message);
     return send(chatId, 'Couldn\'t analyze that site right now 😕 It may be unreachable or Google\'s service is busy. Please try again in a few minutes.', keyboard([backRow]));
+  }
+}
+
+/* ---------- automatic follow-ups ---------- */
+async function runFollowups() {
+  if (!pool) return 0;
+  let sent = 0;
+  const a = await q(`UPDATE tg_users SET followup1_at = now() WHERE chat_id IN (
+      SELECT chat_id FROM tg_users WHERE analyzed_at IS NOT NULL AND followup1_at IS NULL AND NOT unsubscribed
+        AND analyzed_at < now() - ($1 || ' hours')::interval AND analyzed_at > now() - interval '72 hours'
+        AND ${NOT_ADMIN}
+        AND chat_id NOT IN (SELECT chat_id FROM tg_orders WHERE status IN ('paid','pending') AND NOT test)
+        AND chat_id NOT IN (SELECT chat_id FROM tg_subs WHERE expires_at > now()) LIMIT 20)
+    RETURNING chat_id, last_domain, last_score, last_issues`, [String(FU_ANALYSIS_H)]);
+  for (const x of a.rows) {
+    const issues = String(x.last_issues || '').split(' | ').filter(Boolean).map(i => '• ' + i).join('\n');
+    await send(x.chat_id, `👋 Your analysis of ${x.last_domain} is ready to act on.\n` + (x.last_score != null ? `Overall score: ${x.last_score}/100.\n` : '') + (issues ? `\nBiggest things holding it back:\n${issues}\n` : '') +
+      `\nWant us to fix them? The one-time SEO Audit (${AUDIT.price} USDT) gives you a prioritized action list within 48 hours.`,
+      keyboard([[{ text: `🎯 Get the SEO Audit — ${AUDIT.price} USDT`, callback_data: 'd:audit:1' }], [{ text: '📦 See plans', callback_data: 'plans' }], [{ text: '🔕 Stop reminders', callback_data: 'stop' }]]));
+    sent++; await sleep(100);
+  }
+  const b = await q(`UPDATE tg_orders SET followup_at = now() WHERE id IN (
+      SELECT MAX(id) FROM tg_orders WHERE status = 'expired' AND txid IS NULL AND NOT test AND followup_at IS NULL
+        AND expires_at < now() - ($1 || ' hours')::interval AND expires_at > now() - interval '48 hours'
+        AND chat_id NOT IN (SELECT chat_id FROM tg_orders WHERE status IN ('paid','pending') AND NOT test)
+        AND chat_id NOT IN (SELECT chat_id FROM tg_orders WHERE followup_at IS NOT NULL)
+        AND chat_id NOT IN (SELECT chat_id FROM tg_users WHERE followup1_at > now() - interval '24 hours')
+        AND chat_id IN (SELECT chat_id FROM tg_users WHERE NOT unsubscribed AND ${NOT_ADMIN})
+      GROUP BY chat_id LIMIT 20)
+    RETURNING chat_id, plan`, [String(FU_ORDER_H)]);
+  for (const x of b.rows) {
+    await send(x.chat_id, `🧾 You started an order for ${planById(x.plan)?.name || 'a plan'} but it wasn't completed.\nOrders stay open for ${ORDER_TTL_MIN} minutes — you can start a new one any time. If anything was unclear (payment, network, exact amount), just ask here and we'll help.`,
+      keyboard([[{ text: '💳 Buy with USDT', callback_data: 'buy' }], [{ text: '💬 Contact support', callback_data: 'support' }], [{ text: '🔕 Stop reminders', callback_data: 'stop' }]]));
+    sent++; await sleep(100);
+  }
+  return sent;
+}
+async function followupLoop() {
+  await sleep(Math.min(60, FU_TICK) * 1000);
+  for (;;) {
+    try { const n = await runFollowups(); if (n) log('follow-ups sent', n); } catch (e) { log('followups', e.message); }
+    await sleep(FU_TICK * 1000);
   }
 }
 
@@ -297,12 +358,15 @@ const SEGMENTS = {
 };
 async function dashboard(chatId) {
   if (!pool) return send(chatId, 'No database connected.');
-  const [u, o, s] = await Promise.all([
+  const [u, o, s, fu, so] = await Promise.all([
     q(`SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE created_at > now() - interval '1 day')::int AS today, COUNT(*) FILTER (WHERE created_at > now() - interval '7 days')::int AS week, COUNT(*) FILTER (WHERE last_seen > now() - interval '1 day')::int AS active FROM tg_users`),
     q("SELECT COUNT(*) FILTER (WHERE status='paid' AND NOT test)::int AS paid, COUNT(*) FILTER (WHERE status='pending')::int AS pending, COALESCE(SUM(amount_micro) FILTER (WHERE status='paid' AND NOT test),0)::bigint AS revenue FROM tg_orders"),
-    q('SELECT COUNT(*)::int AS c FROM tg_subs WHERE expires_at > now()')]);
-  const a = u.rows[0], b = o.rows[0];
-  const text = `📊 Dashboard\n\n👥 Users: ${a.total}\n🆕 Today: ${a.today}   🗓 7 days: ${a.week}\n🟢 Active (24h): ${a.active}\n\n✅ Active subscribers: ${s.rows[0].c}\n💰 Paid orders: ${b.paid}   ⏳ Pending: ${b.pending}\n💵 Revenue: ${usdt(b.revenue)} USDT\n\nWallet: ${WALLET_OK ? WALLET : '⚠️ NOT SET'}`;
+    q('SELECT COUNT(*)::int AS c FROM tg_subs WHERE expires_at > now()'),
+    q(`SELECT COUNT(*)::int AS starts, COUNT(*) FILTER (WHERE analyzed_at IS NOT NULL)::int AS analyzed, COUNT(*) FILTER (WHERE chat_id IN (SELECT chat_id FROM tg_orders WHERE NOT test))::int AS ordered, COUNT(*) FILTER (WHERE chat_id IN (SELECT chat_id FROM tg_orders WHERE status='paid' AND NOT test))::int AS paid FROM tg_users WHERE ${NOT_ADMIN}`),
+    q(`SELECT COALESCE(source,'direct') AS src, COUNT(*)::int AS n, COUNT(*) FILTER (WHERE analyzed_at IS NOT NULL)::int AS a, COUNT(*) FILTER (WHERE chat_id IN (SELECT chat_id FROM tg_orders WHERE status='paid' AND NOT test))::int AS p FROM tg_users WHERE ${NOT_ADMIN} GROUP BY 1 ORDER BY n DESC LIMIT 8`)]);
+  const a = u.rows[0], b = o.rows[0], f = fu.rows[0], pct = (x, y) => (y ? Math.round(100 * x / y) + '%' : '—');
+  const funnel = `🔻 Funnel (admins excluded)\nStarted: ${f.starts}\nRan analysis: ${f.analyzed} (${pct(f.analyzed, f.starts)})\nStarted checkout: ${f.ordered} (${pct(f.ordered, f.starts)})\nPaid: ${f.paid} (${pct(f.paid, f.starts)})` + (so.rows.length ? '\n\n📣 Sources (started · analysed · paid)\n' + so.rows.map(x => `${x.src}: ${x.n} · ${x.a} · ${x.p}`).join('\n') : '');
+  const text = `📊 Dashboard\n\n👥 Users: ${a.total}\n🆕 Today: ${a.today}   🗓 7 days: ${a.week}\n🟢 Active (24h): ${a.active}\n\n✅ Active subscribers: ${s.rows[0].c}\n💰 Paid orders: ${b.paid}   ⏳ Pending: ${b.pending}\n💵 Revenue: ${usdt(b.revenue)} USDT\n\n${funnel}\n\nWallet: ${WALLET_OK ? WALLET : '⚠️ NOT SET'}`;
   return send(chatId, text, keyboard([
     [{ text: '👥 Customers & services', callback_data: 'adm:cus' }],
     [{ text: '🧾 Recent orders', callback_data: 'adm:orders' }, { text: '✅ Subscribers', callback_data: 'adm:subs' }],
@@ -318,16 +382,17 @@ async function adminLists(chatId, kind) {
   return send(chatId, r.length ? '✅ Active subscribers (soonest expiry first)\n\n' + r.map(x => `${x.username ? '@' + x.username : x.first_name || x.chat_id} · ${x.plan} · until ${new Date(x.expires_at).toISOString().slice(0, 10)}`).join('\n') : 'No active subscribers.', keyboard([[{ text: '🔙 Dashboard', callback_data: 'adm:dash' }]]));
 }
 async function adminCustomers(chatId) {
-  const r = (await q("SELECT s.chat_id, s.plan, s.expires_at, u.username, u.first_name, (SELECT COUNT(*) FROM tg_tasks t WHERE t.chat_id=s.chat_id AND t.status='done')::int AS done, (SELECT COUNT(*) FROM tg_tasks t WHERE t.chat_id=s.chat_id)::int AS total FROM tg_subs s LEFT JOIN tg_users u USING(chat_id) WHERE s.expires_at > now() ORDER BY s.expires_at LIMIT 20")).rows;
-  if (!r.length) return send(chatId, 'No active customers yet.', keyboard([[{ text: '🔙 Dashboard', callback_data: 'adm:dash' }]]));
-  return send(chatId, '👥 Active customers — tap one to manage their services',
-    keyboard([...r.map(x => [{ text: `${x.username ? '@' + x.username : x.first_name || x.chat_id} · ${x.plan} · ${x.done}/${x.total} done`, callback_data: `adm:c:${x.chat_id}` }]), [{ text: '🔙 Dashboard', callback_data: 'adm:dash' }]]));
+  const r = (await q("SELECT x.chat_id, s.plan, u.username, u.first_name, x.done, x.total FROM (SELECT chat_id, COUNT(*)::int AS total, COUNT(*) FILTER (WHERE status='done')::int AS done FROM tg_tasks GROUP BY chat_id) x LEFT JOIN tg_subs s ON s.chat_id = x.chat_id LEFT JOIN tg_users u ON u.chat_id = x.chat_id ORDER BY (x.done = x.total), x.chat_id DESC LIMIT 20")).rows;
+  if (!r.length) return send(chatId, 'No customers yet.', keyboard([[{ text: '🔙 Dashboard', callback_data: 'adm:dash' }]]));
+  return send(chatId, '👥 Customers (unfinished work first) — tap one to manage their services',
+    keyboard([...r.map(x => [{ text: `${x.username ? '@' + x.username : x.first_name || x.chat_id} · ${x.plan || 'audit'} · ${x.done}/${x.total} done`, callback_data: `adm:c:${x.chat_id}` }]), [{ text: '🔙 Dashboard', callback_data: 'adm:dash' }]]));
 }
 async function adminCustomer(chatId, cid) {
-  const s = (await q('SELECT s.plan, s.expires_at, u.username, u.first_name FROM tg_subs s LEFT JOIN tg_users u USING(chat_id) WHERE s.chat_id=$1', [cid])).rows[0];
-  if (!s) return send(chatId, 'That customer has no subscription.');
+  const s = (await q('SELECT s.plan, s.expires_at, u.username, u.first_name FROM tg_users u LEFT JOIN tg_subs s ON s.chat_id = u.chat_id WHERE u.chat_id=$1', [cid])).rows[0];
+  if (!s) return send(chatId, 'Customer not found.');
   const t = (await q('SELECT id, title, status FROM tg_tasks WHERE chat_id=$1 ORDER BY id DESC LIMIT 40', [cid])).rows.reverse();
-  return send(chatId, `👤 ${s.first_name || ''} ${s.username ? '@' + s.username : ''} (${cid})\nPlan: ${s.plan} · until ${new Date(s.expires_at).toISOString().slice(0, 10)}\n\nTap a service to change its status (⏳ → 🔄 → ✅). The customer is notified.\nMessage them: /reply ${cid} <text>`,
+  const planLine = s.plan ? `Plan: ${s.plan} · until ${new Date(s.expires_at).toISOString().slice(0, 10)}` : 'Plan: SEO Audit (one-time)';
+  return send(chatId, `👤 ${s.first_name || ''} ${s.username ? '@' + s.username : ''} (${cid})\n${planLine}\n\nTap a service to change its status (⏳ → 🔄 → ✅). The customer is notified.\nMessage them: /reply ${cid} <text>`,
     keyboard([...t.map(x => [{ text: `${TASK_ICON[x.status] || '⏳'} ${String(x.title).slice(0, 50)}`, callback_data: `adm:t:${x.id}` }]), [{ text: '🔙 Customers', callback_data: 'adm:cus' }]]));
 }
 async function adminTask(chatId, id) {
@@ -338,7 +403,7 @@ async function adminTask(chatId, id) {
   if (x.status === 'done') send(x.chat_id, `✅ Done: “${x.title}” is complete.`, btn);
   return adminCustomer(chatId, x.chat_id);
 }
-const segIds = async key => (SEGMENTS[key] ? (await q(`SELECT chat_id FROM tg_users WHERE ${SEGMENTS[key].sql}`)).rows.map(r => Number(r.chat_id)) : []);
+const segIds = async key => (SEGMENTS[key] ? (await q(`SELECT chat_id FROM tg_users WHERE (${SEGMENTS[key].sql}) AND NOT unsubscribed`)).rows.map(r => Number(r.chat_id)) : []);
 async function doBroadcast(adminId) {
   const p = pendingBroadcast.get(String(adminId)); pendingBroadcast.delete(String(adminId));
   if (!p) return send(adminId, 'Nothing to send.');
@@ -352,7 +417,7 @@ async function adminCommand(chatId, text) {
   if (cmd === '/dashboard' || cmd === '/stats') return dashboard(chatId);
   if (cmd === '/testpay') {              // free end-to-end test: simulates a confirmed payment for the admin
     const plan = planById(rest[0] || 'growth');
-    if (!plan) return send(chatId, 'Usage: /testpay [start|growth|scale]');
+    if (!plan) return send(chatId, 'Usage: /testpay [audit|start|growth|scale]');
     return startOrder(chatId, plan.id, 1, true);
   }
   if (cmd === '/testreset') {            // removes the admin's own test data so the test can be repeated
@@ -362,12 +427,13 @@ async function adminCommand(chatId, text) {
     return send(chatId, '🧹 Test data removed. Run /testpay again to repeat the test.');
   }
   if (cmd === '/orders') return adminLists(chatId, 'orders');
+  if (cmd === '/followups') { const n = await runFollowups(); return send(chatId, `Follow-ups sent: ${n}`); }
   if (cmd === '/customers') return adminCustomers(chatId);
   if (cmd === '/customer') return /^\d+$/.test(rest[0] || '') ? adminCustomer(chatId, rest[0]) : send(chatId, 'Usage: /customer <chat_id>');
   if (cmd === '/check') { const n = await checkPayments(); return send(chatId, `Checked the chain. Matched payments: ${n}`); }
   if (cmd === '/activate') {            // /activate <chat_id> <plan> <months>   (manual fallback)
     const [id, planId, m] = rest, plan = planById(planId), months = Number(m || 1);
-    if (!/^\d+$/.test(id || '') || !plan || ![1, 3].includes(months)) return send(chatId, 'Usage: /activate <chat_id> <start|growth|scale> <1|3>');
+    if (!/^\d+$/.test(id || '') || !plan || ![1, 3].includes(months)) return send(chatId, 'Usage: /activate <chat_id> <audit|start|growth|scale> <1|3>');
     const o = (await q("INSERT INTO tg_orders(chat_id, plan, months, amount_micro, status, expires_at, paid_at) VALUES($1,$2,$3,0,'paid', now(), now()) RETURNING *", [id, plan.id, months])).rows[0];
     await activate(o, 'manual-' + o.id, false);
     return send(chatId, `Activated ${plan.name} × ${months} for ${id}.`);
@@ -397,6 +463,7 @@ async function onCallback(cb) {
     if (data === 'bc_yes') return doBroadcast(cb.from.id);
     if (data === 'bc_no') { pendingBroadcast.delete(String(cb.from.id)); return send(chatId, 'Cancelled.'); }
   }
+  if (data === 'stop') { await q('UPDATE tg_users SET unsubscribed = true WHERE chat_id=$1', [chatId]); return send(chatId, '🔕 Reminders turned off. You can still use the bot any time.', keyboard([backRow])); }
   if (data === 'menu') return showMenu(chatId, cb.from?.first_name);
   if (data === 'analyze') return askAnalyze(chatId);
   if (data === 'plans') return showPlans(chatId);
@@ -422,10 +489,11 @@ async function onMessage(msg) {
       if (text === '/cancel') { adminAwait.delete(String(chatId)); return send(chatId, 'Cancelled.'); }
       if (text && !text.startsWith('/')) { adminAwait.delete(String(chatId)); pendingBroadcast.set(String(chatId), { text, seg: key }); const n = (await segIds(key)).length; return send(chatId, `Preview (to ${n} users, “${SEGMENTS[key].label}”):\n\n${text}`, keyboard([[{ text: '✅ Send', callback_data: 'bc_yes' }, { text: '✖️ Cancel', callback_data: 'bc_no' }]])); }
     }
-    if (/^\/(dashboard|stats|orders|customers|customer|check|activate|testpay|testreset)\b/.test(text)) { if (await adminCommand(chatId, text) !== false) return; }
+    if (/^\/(dashboard|stats|orders|followups|customers|customer|check|activate|testpay|testreset)\b/.test(text)) { if (await adminCommand(chatId, text) !== false) return; }
     // admin replies to a forwarded customer message: "/reply <chat_id> text"
     const m = text.match(/^\/reply\s+(\d+)\s+([\s\S]+)/); if (m) { await send(m[1], m[2]); return send(chatId, 'Sent.'); }
   }
+  if (text === '/stop' && pool) { await q('UPDATE tg_users SET unsubscribed = true WHERE chat_id=$1', [chatId]); return send(chatId, '🔕 Reminders turned off. You can still use the bot any time.', keyboard([backRow])); }
   if (text === '/menu' || text === '/help') return showMenu(chatId, from?.first_name);
   if (text === '/plans') return showPlans(chatId);
   if (text === '/buy') return showBuy(chatId);
@@ -476,6 +544,7 @@ async function main() {
   });
   server.listen(PORT, () => log(`server on port ${PORT}`));
   pollLoop();
+  if (FU_ON && pool) followupLoop();
   const useWebhook = MODE === 'webhook' || (MODE === 'auto' && PUBLIC_URL);
   if (useWebhook) {
     try { await tg('setWebhook', { url: `${PUBLIC_URL}/webhook/${WEBHOOK_SECRET}`, allowed_updates: ['message', 'callback_query'] }); log('webhook set'); return; }
