@@ -62,6 +62,16 @@ async function initStore() {
     CREATE TABLE IF NOT EXISTS bale_leads (
       id SERIAL PRIMARY KEY, chat_id BIGINT, phone VARCHAR(20), note TEXT, created_at TIMESTAMPTZ DEFAULT now()
     );`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bale_tickets (
+      id SERIAL PRIMARY KEY, chat_id BIGINT NOT NULL, name VARCHAR(200), status VARCHAR(10) NOT NULL DEFAULT 'open',
+      created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS bale_ticket_msgs (
+      id SERIAL PRIMARY KEY, ticket_id INTEGER NOT NULL, sender VARCHAR(10) NOT NULL, body TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS bale_tickets_chat ON bale_tickets(chat_id);
+    CREATE INDEX IF NOT EXISTS bale_ticket_msgs_t ON bale_ticket_msgs(ticket_id);`);
 }
 async function touchUser(from, source) {
   if (!from) return;
@@ -175,7 +185,7 @@ const TIPS = [
 const mainMenu = () => keyboard([
   [{ text: '🔍 تحلیل رایگان سایت', callback_data: 'analyze' }],
   [{ text: '📦 پلن‌ها و قیمت', callback_data: 'plans' }, { text: '🎁 کد تخفیف', callback_data: 'discount' }],
-  [{ text: '💡 نکته‌ی سئو', callback_data: 'tip' }, { text: '📞 مشاوره‌ی رایگان', callback_data: 'contact' }],
+  [{ text: '💡 نکته‌ی سئو', callback_data: 'tip' }, { text: '🎫 پشتیبانی (تیکت)', callback_data: 'support' }],
   [{ text: '🌐 ورود به سایت رشدینک', url: siteLink('menu') }],
 ]);
 const backRow = [{ text: '🏠 منوی اصلی', callback_data: 'menu' }];
@@ -183,10 +193,10 @@ const backRow = [{ text: '🏠 منوی اصلی', callback_data: 'menu' }];
 const WELCOME = (name) =>
   `سلام${name ? ' ' + name : ''} 👋\nبه ربات رشدینک خوش اومدی.\n\n` +
   'رشدینک به صاحبان کسب‌وکار کمک می‌کند در گوگل بهتر دیده شوند.\n' +
-  'اینجا می‌توانی:\n• سایتت را رایگان تحلیل کنی (سرعت و سئو)\n• پلن‌ها و قیمت‌ها را ببینی\n• کد تخفیف فعال را بگیری\n• برای مشاوره‌ی رایگان درخواست بدهی\n\nیکی را انتخاب کن 👇';
+  'اینجا می‌توانی:\n• سایتت را رایگان تحلیل کنی (سرعت و سئو)\n• پلن‌ها و قیمت‌ها را ببینی\n• کد تخفیف فعال را بگیری\n• سؤالت را با پشتیبانی (تیکت) در میان بگذاری\n\nیکی را انتخاب کن 👇';
 
 /* ---------- وضعیت گفتگو (در حافظه) ---------- */
-const state = new Map();            // chatId -> 'analyze' | 'contact'
+const state = new Map();            // chatId -> 'analyze' | 'ticket' | 'tkr:<id>'
 const rate = new Map();             // chatId -> [timestamps]
 const pendingBroadcast = new Map(); // adminId -> { text, seg }
 const adminAwait = new Map();       // adminId -> کلید گروهی که مدیر قرار است برایش پیام بنویسد
@@ -271,7 +281,7 @@ async function runAnalyze(chatId, text) {
       `✅ پلن پیشنهادی ما: ${rec.name}`;
     await countAnalysis(chatId);
     return send(chatId, out, keyboard([
-      [{ text: '📦 دیدن پلن‌ها', callback_data: 'plans' }, { text: '📞 مشاوره‌ی رایگان', callback_data: 'contact' }],
+      [{ text: '📦 دیدن پلن‌ها', callback_data: 'plans' }, { text: '🎫 پشتیبانی (تیکت)', callback_data: 'support' }],
       [{ text: '🌐 گزارش کامل در سایت', url: siteLink('analysis') }], backRow]));
   } catch (e) {
     log('analyze failed', host, e.message);
@@ -289,13 +299,111 @@ async function handleContact(chatId, from, text) {
   return send(chatId, '✅ درخواستت ثبت شد. به‌زودی باهات تماس می‌گیریم.\nتا اون موقع می‌توانی سایتت را رایگان تحلیل کنی.', keyboard([[{ text: '🔍 تحلیل رایگان سایت', callback_data: 'analyze' }], backRow]));
 }
 
+/* ---------- پشتیبانی به‌صورت تیکت ---------- */
+const TK_STATUS = { open: '🟡 در انتظار پاسخ', answered: '🟢 پاسخ داده شد', closed: '⚪ بسته' };
+const ticketAwait = new Map();       // adminId -> شناسه‌ی تیکتی که مدیر در حال نوشتن پاسخش است
+const tkRate = new Map();
+mem.tickets = []; mem.tseq = 0;
+function allowTicket(chatId) {
+  const now = Date.now(), list = (tkRate.get(chatId) || []).filter(t => now - t < 3600e3);
+  if (list.length >= 10) { tkRate.set(chatId, list); return false; }
+  list.push(now); tkRate.set(chatId, list); return true;
+}
+async function tkCreate(chatId, from, text) {
+  const name = from ? ((from.first_name || '') + (from.username ? ' @' + from.username : '')).trim().slice(0, 200) : '';
+  if (!pool) { const t = { id: ++mem.tseq, chat_id: chatId, name, status: 'open', created_at: new Date(), msgs: [{ sender: 'user', body: text, created_at: new Date() }] }; mem.tickets.push(t); return t; }
+  const t = (await pool.query('INSERT INTO bale_tickets(chat_id, name) VALUES($1,$2) RETURNING *', [chatId, name])).rows[0];
+  await pool.query("INSERT INTO bale_ticket_msgs(ticket_id, sender, body) VALUES($1,'user',$2)", [t.id, text]);
+  return t;
+}
+async function tkAdd(id, sender, text) {          // پیام جدید؛ وضعیت را هم به‌روز می‌کند
+  const status = sender === 'admin' ? 'answered' : 'open';
+  if (!pool) { const t = mem.tickets.find(x => x.id === id); if (!t) return null; t.msgs.push({ sender, body: text, created_at: new Date() }); t.status = status; return t; }
+  const r = await pool.query('UPDATE bale_tickets SET status=$2, updated_at=now() WHERE id=$1 RETURNING *', [id, status]);
+  if (!r.rows[0]) return null;
+  await pool.query('INSERT INTO bale_ticket_msgs(ticket_id, sender, body) VALUES($1,$2,$3)', [id, sender, text]);
+  return r.rows[0];
+}
+async function tkGet(id) {
+  if (!pool) { const t = mem.tickets.find(x => x.id === id); return t ? { t, msgs: t.msgs } : null; }
+  const t = (await pool.query('SELECT * FROM bale_tickets WHERE id=$1', [id])).rows[0]; if (!t) return null;
+  const msgs = (await pool.query('SELECT sender, body, created_at FROM bale_ticket_msgs WHERE ticket_id=$1 ORDER BY id', [id])).rows;
+  return { t, msgs };
+}
+async function tkList(chatId, onlyOpen) {
+  if (!pool) return mem.tickets.filter(t => (chatId == null || t.chat_id === chatId) && (!onlyOpen || t.status === 'open')).slice(-15).reverse();
+  return (await pool.query(`SELECT * FROM bale_tickets WHERE ($1::bigint IS NULL OR chat_id=$1) AND (NOT $2::boolean OR status='open') ORDER BY updated_at DESC LIMIT 15`, [chatId, !!onlyOpen])).rows;
+}
+async function tkClose(id) {
+  if (!pool) { const t = mem.tickets.find(x => x.id === id); if (t) t.status = 'closed'; return !!t; }
+  return (await pool.query("UPDATE bale_tickets SET status='closed', updated_at=now() WHERE id=$1 RETURNING id", [id])).rows.length > 0;
+}
+async function tkOpenCount() { return (await tkList(null, true)).length; }
+
+async function askSupport(chatId) {
+  state.set(chatId, 'ticket');
+  return send(chatId, '🎫 پشتیبانی رشدینک\n\nسؤال یا مشکلت را در یک پیام بنویس و بفرست. تیم پشتیبانی بررسی می‌کند و پاسخ را همین‌جا برایت می‌فرستد.\n\n(فعلاً فقط پیام متنی ثبت می‌شود.)', keyboard([[{ text: '📂 تیکت‌های من', callback_data: 'mytickets' }], backRow]));
+}
+async function handleTicketText(chatId, from, text, ticketId) {
+  text = String(text || '').trim().slice(0, 2000);
+  if (text.length < 5) return send(chatId, 'پیامت خیلی کوتاه است 🤔 لطفاً سؤالت را کمی کامل‌تر بنویس.', keyboard([backRow]));
+  if (!allowTicket(chatId)) { state.delete(chatId); return send(chatId, 'تعداد پیام‌هایت در این ساعت زیاد شد. کمی بعد دوباره بفرست 🙏', keyboard([backRow])); }
+  let t;
+  if (ticketId) {
+    const cur = await tkGet(ticketId);
+    if (!cur || String(cur.t.chat_id) !== String(chatId)) { state.delete(chatId); return send(chatId, 'این تیکت پیدا نشد.', keyboard([backRow])); }
+    t = await tkAdd(ticketId, 'user', text);
+  } else t = await tkCreate(chatId, from, text);
+  state.delete(chatId);
+  const who = `${from?.first_name || ''} ${from?.username ? '@' + from.username : ''}`.trim();
+  for (const a of ADMIN_IDS) send(a, `🎫 ${ticketId ? 'پیام جدید در تیکت' : 'تیکت جدید'} #${faDigits(t.id)}\nاز: ${who || chatId} (شناسه ${chatId})\n\n${text}`, keyboard([[{ text: '💬 پاسخ', callback_data: 'ta:' + t.id }, { text: '✅ بستن', callback_data: 'tc:' + t.id }]]));
+  if (!ADMIN_IDS.length) log('ticket without admins', t.id);
+  return send(chatId, `✅ ${ticketId ? 'پیامت به تیکت' : 'تیکتت با شماره'} #${faDigits(t.id)} ثبت شد.\nپاسخ را همین‌جا برایت می‌فرستیم.`, keyboard([[{ text: '📂 تیکت‌های من', callback_data: 'mytickets' }], backRow]));
+}
+function tkRows(list) { return list.map(t => [{ text: `#${t.id} ${TK_STATUS[t.status] || t.status}`, callback_data: 'tv:' + t.id }]); }
+async function showMyTickets(chatId) {
+  const list = await tkList(chatId, false);
+  if (!list.length) return send(chatId, 'هنوز تیکتی نداری.', keyboard([[{ text: '🎫 ثبت تیکت جدید', callback_data: 'support' }], backRow]));
+  return send(chatId, '📂 تیکت‌های من\nروی هر تیکت بزن تا گفتگو را ببینی:', keyboard([...tkRows(list), [{ text: '🎫 تیکت جدید', callback_data: 'support' }], backRow]));
+}
+async function viewTicket(chatId, id, admin) {
+  const g = await tkGet(id);
+  if (!g || (!admin && String(g.t.chat_id) !== String(chatId))) return send(chatId, 'تیکت پیدا نشد.', keyboard([backRow]));
+  let body = g.msgs.map(m => `${m.sender === 'admin' ? '🛠 پشتیبان' : '👤 ' + (admin ? (g.t.name || 'کاربر') : 'من')}:\n${m.body}`).join('\n\n— — —\n\n');
+  if (body.length > 3200) body = '…\n' + body.slice(-3200);
+  const btn = g.t.status === 'closed' ? [] : admin
+    ? [[{ text: '💬 پاسخ', callback_data: 'ta:' + id }, { text: '✅ بستن', callback_data: 'tc:' + id }]]
+    : [[{ text: '✍️ ارسال پیام جدید', callback_data: 'tr:' + id }, { text: '✅ بستن تیکت', callback_data: 'tc:' + id }]];
+  return send(chatId, `🎫 تیکت #${faDigits(id)} — ${TK_STATUS[g.t.status] || g.t.status}${admin ? `\nکاربر: ${g.t.name || ''} (${g.t.chat_id})` : ''}\n\n${body}`, keyboard([...btn, admin ? [{ text: '📋 تیکت‌های باز', callback_data: 'tl' }] : [{ text: '📂 تیکت‌های من', callback_data: 'mytickets' }], backRow]));
+}
+async function replyTicket(adminId, id, text) {
+  text = String(text || '').trim().slice(0, 3000);
+  const g = await tkGet(id);
+  if (!g) return send(adminId, 'تیکت پیدا نشد.');
+  if (!text) return send(adminId, 'متن پاسخ خالی است.');
+  await tkAdd(id, 'admin', text);
+  try {
+    await bale('sendMessage', { chat_id: g.t.chat_id, text: `📩 پاسخ پشتیبانی — تیکت #${faDigits(id)}\n\n${text}`, ...keyboard([[{ text: '✍️ ادامه‌ی گفتگو', callback_data: 'tr:' + id }, { text: '✅ بستن تیکت', callback_data: 'tc:' + id }]]) });
+  } catch (e) { return send(adminId, `⚠️ پاسخ ذخیره شد ولی به کاربر نرسید (${e.message}). احتمالاً ربات را مسدود کرده است.`); }
+  return send(adminId, `✅ پاسخ تیکت #${faDigits(id)} برای کاربر ارسال شد.`);
+}
+async function adminTickets(chatId) {
+  const list = await tkList(null, true);
+  if (!list.length) return send(chatId, '✅ تیکت بازی نیست.');
+  return send(chatId, `📋 تیکت‌های در انتظار پاسخ (${faDigits(list.length)})`, keyboard(tkRows(list)));
+}
+
 /* ---------- بخش مدیر ---------- */
 async function adminCommand(chatId, text) {
   const [cmd, ...rest] = text.split(/\s+/); const arg = rest.join(' ').trim();
+  if (cmd === '/tickets') return adminTickets(chatId);
+  if (cmd === '/ticket') return /^\d+$/.test(arg) ? viewTicket(chatId, Number(arg), true) : send(chatId, 'نمونه: /ticket 12');
+  if (cmd === '/reply') { const m = arg.match(/^(\d+)\s+([\s\S]+)/); return m ? replyTicket(chatId, Number(m[1]), m[2]) : send(chatId, 'نمونه: /reply 12 متن پاسخ'); }
+  if (cmd === '/close') { if (!/^\d+$/.test(arg)) return send(chatId, 'نمونه: /close 12'); return send(chatId, (await tkClose(Number(arg))) ? `تیکت #${faDigits(arg)} بسته شد.` : 'تیکت پیدا نشد.'); }
   if (cmd === '/stats') {
     const s = await stats();
     const src = Object.entries(s.sources).map(([k, v]) => `  ${k}: ${faDigits(v)}`).join('\n');
-    return send(chatId, `📈 آمار ربات\nکاربران: ${faDigits(s.users)}\nتحلیل‌ها: ${faDigits(s.analyses)}\nدرخواست مشاوره: ${faDigits(s.leads)}` + (src ? `\n\nمنبع ورود:\n${src}` : ''));
+    return send(chatId, `📈 آمار ربات\nکاربران: ${faDigits(s.users)}\nتحلیل‌ها: ${faDigits(s.analyses)}\nدرخواست مشاوره: ${faDigits(s.leads)}\nتیکت‌های باز: ${faDigits(await tkOpenCount())}` + (src ? `\n\nمنبع ورود:\n${src}` : ''));
   }
   if (cmd === '/dashboard') return dashboardView(chatId);
   if (cmd === '/leads') {
@@ -366,13 +474,24 @@ async function onCallback(cb) {
     if (data?.startsWith('seg:')) { const [, k, p] = data.split(':'); return segView(chatId, k, parseInt(p, 10) || 0); }
     if (data?.startsWith('sbc:')) return segBroadcastAsk(chatId, data.slice(4));
   }
+  if (typeof data === 'string' && /^(ta|tc|tv|tr):\d+$/.test(data)) {
+    const [k, sid] = data.split(':'), id = Number(sid), adm = isAdmin(cb.from?.id);
+    if (k === 'ta') { if (!adm) return; ticketAwait.set(String(chatId), id); return send(chatId, `✍️ پاسخت را برای تیکت #${faDigits(id)} بنویس و بفرست.\n(برای لغو: /cancel)`); }
+    if (k === 'tv') return viewTicket(chatId, id, adm);
+    const g = await tkGet(id);
+    if (!g || (!adm && String(g.t.chat_id) !== String(chatId))) return send(chatId, 'تیکت پیدا نشد.', keyboard([backRow]));
+    if (k === 'tr') { state.set(chatId, 'tkr:' + id); return send(chatId, `✍️ پیام جدیدت را برای تیکت #${faDigits(id)} بنویس:`, keyboard([backRow])); }
+    if (k === 'tc') { await tkClose(id); if (String(g.t.chat_id) !== String(chatId)) bale('sendMessage', { chat_id: g.t.chat_id, text: `✅ تیکت #${faDigits(id)} بسته شد. اگر سؤال دیگری داشتی، تیکت جدید ثبت کن.` }).catch(() => {}); return send(chatId, `✅ تیکت #${faDigits(id)} بسته شد.`, keyboard([backRow])); }
+  }
+  if (data === 'tl' && isAdmin(cb.from?.id)) return adminTickets(chatId);
   switch (data) {
+    case 'support': case 'contact': return askSupport(chatId);
+    case 'mytickets': return showMyTickets(chatId);
     case 'menu': return showMenu(chatId, cb.from?.first_name);
     case 'analyze': return askAnalyze(chatId);
     case 'plans': return showPlans(chatId);
     case 'discount': return showDiscount(chatId);
     case 'tip': return showTip(chatId);
-    case 'contact': return askContact(chatId);
     case 'bc_yes': return isAdmin(cb.from?.id) ? doBroadcast(cb.from.id) : null;
     case 'bc_no': pendingBroadcast.delete(String(cb.from?.id)); return send(chatId, 'لغو شد.');
   }
@@ -397,12 +516,19 @@ async function onMessage(msg) {
       return send(chatId, `پیش‌نمایش پیام (برای ${faDigits(n)} نفر از «${SEGMENTS[key].label}»):\n\n${text}`, keyboard([[{ text: '✅ ارسال', callback_data: 'bc_yes' }, { text: '✖️ لغو', callback_data: 'bc_no' }]]));
     }
   }
-  if (isAdmin(msg.from?.id) && /^\/(stats|dashboard|leads|broadcast)\b/.test(text)) { if (await adminCommand(chatId, text) !== false) return; }
+  if (isAdmin(msg.from?.id) && ticketAwait.has(String(chatId))) {
+    const id = ticketAwait.get(String(chatId));
+    if (text === '/cancel') { ticketAwait.delete(String(chatId)); return send(chatId, 'لغو شد.'); }
+    if (text && !text.startsWith('/')) { ticketAwait.delete(String(chatId)); return replyTicket(chatId, id, text); }
+  }
+  if (isAdmin(msg.from?.id) && /^\/(stats|dashboard|leads|broadcast|tickets|ticket|reply|close)\b/.test(text)) { if (await adminCommand(chatId, text) !== false) return; }
   if (text === '/menu' || text === '/help') return showMenu(chatId, msg.from?.first_name);
   if (text === '/plans') return showPlans(chatId);
   if (text === '/analyze') return askAnalyze(chatId);
   const st = state.get(chatId);
-  if (st === 'contact') return handleContact(chatId, msg.from, text);
+  if (text === '/support' || text === '/ticket') return askSupport(chatId);
+  if (st === 'ticket' || st === 'contact') return handleTicketText(chatId, msg.from, text || msg.caption, null);
+  if (typeof st === 'string' && st.startsWith('tkr:')) return handleTicketText(chatId, msg.from, text || msg.caption, Number(st.slice(4)));
   if (st === 'analyze') return runAnalyze(chatId, text);
   if (!text) return;
   if (extractHost(text)) return runAnalyze(chatId, text);   // اگر مستقیم آدرس بفرستد
