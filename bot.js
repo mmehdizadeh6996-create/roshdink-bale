@@ -72,6 +72,17 @@ async function initStore() {
     );
     CREATE INDEX IF NOT EXISTS bale_tickets_chat ON bale_tickets(chat_id);
     CREATE INDEX IF NOT EXISTS bale_ticket_msgs_t ON bale_ticket_msgs(ticket_id);`);
+  await pool.query(`
+    ALTER TABLE bale_users ADD COLUMN IF NOT EXISTS fu_stage INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE bale_users ADD COLUMN IF NOT EXISTS fu_next TIMESTAMPTZ;
+    ALTER TABLE bale_users ADD COLUMN IF NOT EXISTS fu_stop VARCHAR(20);
+    ALTER TABLE bale_users ADD COLUMN IF NOT EXISTS fu_code VARCHAR(30);
+    ALTER TABLE bale_users ADD COLUMN IF NOT EXISTS fu_code_exp TIMESTAMPTZ;
+    ALTER TABLE bale_users ADD COLUMN IF NOT EXISTS fu_host TEXT;
+    ALTER TABLE bale_users ADD COLUMN IF NOT EXISTS fu_score INTEGER;
+    ALTER TABLE bale_users ADD COLUMN IF NOT EXISTS fu_issue TEXT;
+    ALTER TABLE bale_users ADD COLUMN IF NOT EXISTS fu_plan VARCHAR(10);
+    CREATE INDEX IF NOT EXISTS bale_users_fu ON bale_users(fu_next) WHERE fu_stop IS NULL;`);
 }
 async function touchUser(from, source) {
   if (!from) return;
@@ -81,7 +92,7 @@ async function touchUser(from, source) {
     u.last = Date.now(); mem.users.set(id, u); return;
   }
   await pool.query(
-    `INSERT INTO bale_users(chat_id, first_name, username, source) VALUES($1,$2,$3,$4)
+    `INSERT INTO bale_users(chat_id, first_name, username, source, fu_next) VALUES($1,$2,$3,$4, now() + interval '3 hours')
      ON CONFLICT (chat_id) DO UPDATE SET last_seen=now(), first_name=EXCLUDED.first_name, username=EXCLUDED.username`,
     [id, name, uname, source || null]).catch(e => log('touchUser', e.message));
 }
@@ -218,15 +229,16 @@ async function showPlans(chatId) {
 }
 
 async function showDiscount(chatId) {
-  let d = null;
-  try { const r = await fetch(`${API_BASE}/api/discounts/active`, { signal: AbortSignal.timeout(15000) }); d = r.ok ? await r.json() : null; } catch {}
+  let d = null, personal = false;
+  if (pool) { try { const u = (await pool.query('SELECT fu_code FROM bale_users WHERE chat_id=$1', [chatId])).rows[0]; if (u?.fu_code) { const c = (await pool.query('SELECT code, percent, plan_id, expires_at FROM discounts WHERE code=$1 AND active=true AND expires_at > now() AND (max_uses IS NULL OR used_count < max_uses)', [u.fu_code])).rows[0]; if (c) { d = c; personal = true; } } } catch {} }
+  if (!d) try { const r = await fetch(`${API_BASE}/api/discounts/active`, { signal: AbortSignal.timeout(15000) }); d = r.ok ? await r.json() : null; } catch {}
   if (!d) return send(chatId, 'در حال حاضر کد تخفیف فعالی نداریم. 🙏\nولی تحلیل سایتت همیشه رایگان است.', keyboard([[{ text: '🔍 تحلیل رایگان سایت', callback_data: 'analyze' }], backRow]));
   const left = Math.max(0, new Date(d.expires_at) - Date.now());
   const days = Math.floor(left / 86400e3), hours = Math.floor((left % 86400e3) / 3600e3);
   const plan = d.plan_id ? (PLANS.find(p => p.id === d.plan_id) || {}).name : null;
   return send(chatId,
-    `🎁 کد تخفیف فعال\n\nکد: ${d.code}\nتخفیف: ${faDigits(d.percent)}٪${plan ? ' (فقط پلن ' + plan + ')' : ''}\n⏳ مهلت: ${faDigits(days)} روز و ${faDigits(hours)} ساعت\n\nموقع پرداخت در سایت، کد را وارد کن.`,
-    keyboard([[{ text: '🛒 رفتن به سایت', url: siteLink('discount') + '#plans' }], backRow]));
+    `🎁 ${personal ? 'کد تخفیف اختصاصی تو' : 'کد تخفیف فعال'}\n\nکد: ${d.code}\nتخفیف: ${faDigits(d.percent)}٪${plan ? ' (فقط پلن ' + plan + ')' : ''}\n⏳ مهلت: ${faDigits(days)} روز و ${faDigits(hours)} ساعت\n\nروی دکمه‌ی زیر بزن؛ تخفیف خودکار روی سایت اعمال می‌شود.`,
+    keyboard([[{ text: '🛒 رفتن به سایت با تخفیف', url: siteLink('discount') + (personal ? '&code=' + d.code : '') + '#plans' }], backRow]));
 }
 
 async function showTip(chatId) {
@@ -280,6 +292,7 @@ async function runAnalyze(chatId, text) {
       (issues ? `🔧 مهم‌ترین موارد برای بهبود:\n${issues}\n\n` : '') +
       `✅ پلن پیشنهادی ما: ${rec.name}`;
     await countAnalysis(chatId);
+    funnelAnalyzed(chatId, data.host || host, overall, (m.topIssues || [])[0]?.title, rec.id).catch(() => {});
     return send(chatId, out, keyboard([
       [{ text: '📦 دیدن پلن‌ها', callback_data: 'plans' }, { text: '🎫 پشتیبانی (تیکت)', callback_data: 'support' }],
       [{ text: '🌐 گزارش کامل در سایت', url: siteLink('analysis') }], backRow]));
@@ -393,9 +406,111 @@ async function adminTickets(chatId) {
   return send(chatId, `📋 تیکت‌های در انتظار پاسخ (${faDigits(list.length)})`, keyboard(tkRows(list)));
 }
 
+/* ---------- قیف فروش: پیگیری خودکار با حداکثر ۳ پیام ---------- */
+const FU_ON = !/^(0|off|false|no)$/i.test(process.env.FOLLOWUPS || 'on');
+const FU_PERCENT = Number(process.env.FU_PERCENT || 15), FU_CODE_HOURS = Number(process.env.FU_CODE_HOURS || 48);
+const tehranHour = () => Number(new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Tehran', hour: '2-digit', hourCycle: 'h23' }).format(new Date()));
+const inSendWindow = () => { if (/^(0|off|false|no|any)$/i.test(process.env.FU_WINDOW || '')) return true; const h = tehranHour(); return h >= 9 && h < 22; };   // شب پیام نمی‌فرستیم
+const stopRow = [{ text: '🔕 دیگر پیام نفرست', callback_data: 'fu_stop' }];
+const planOf = id => PLANS.find(p => p.id === id) || PLANS[1];
+const priceAfter = (price, pct) => Math.round((price * (1 - pct / 100)) / 1000) * 1000;
+const newCode = () => 'U-' + [...crypto.randomBytes(6)].map(b => 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'[b % 31]).join('');
+
+async function funnelAnalyzed(chatId, host, score, issue, planId) {   // بعد از تحلیل، پیگیری شخصی‌سازی می‌شود
+  if (!pool) return;
+  await pool.query(`UPDATE bale_users SET fu_host=$2, fu_score=$3, fu_issue=$4, fu_plan=$5,
+    fu_next = CASE WHEN fu_stop IS NULL AND fu_stage = 0 THEN now() + interval '2 hours' ELSE fu_next END WHERE chat_id=$1`,
+    [chatId, String(host).slice(0, 200), score == null ? null : Math.round(score), issue ? String(issue).slice(0, 160) : null, planId || null]);
+}
+async function issueCode(u) {
+  for (let i = 0; i < 4; i++) {
+    const code = newCode();
+    try {
+      const r = await pool.query("INSERT INTO discounts(code, percent, plan_id, expires_at, max_uses) VALUES($1,$2,NULL, now() + make_interval(hours => $3), 3) RETURNING code, expires_at", [code, FU_PERCENT, FU_CODE_HOURS]);
+      return r.rows[0];
+    } catch (e) { if (!/duplicate|unique/i.test(e.message)) throw e; }
+  }
+  throw new Error('could not create a discount code');
+}
+function followupText(u, stage, codeRow) {
+  const name = u.first_name ? u.first_name : 'دوست من', plan = planOf(u.fu_plan), host = u.fu_host;
+  const link = code => siteLink('fu' + stage) + (code ? '&code=' + code : '') + '#plans';
+  if (stage === 0 && host) {
+    return { text: `${name}، یادته ${host} را تحلیل کردی؟\n\nنمره‌ی کلی‌ات ${faDigits(u.fu_score ?? '—')} از ۱۰۰ بود${u.fu_issue ? ' و مهم‌ترین مشکل: «' + u.fu_issue + '»' : ''}.\n\nتا این مشکل‌ها حل نشوند، بخشی از جستجوهای مشتری‌هایت به رقبایت می‌رسد. خبر خوب اینکه بیشترشان قابل‌حل‌اند.\n\n✅ پلن پیشنهادی برای تو: ${plan.name} (${fmt(plan.price)} تومان در ماه)\nسؤالی داری؟ از «🎫 پشتیبانی» تیکت بزن؛ همین‌جا جواب می‌دهیم.`,
+      kb: [[{ text: '📦 دیدن پلن‌ها', callback_data: 'plans' }, { text: '🎫 سؤال دارم', callback_data: 'support' }], stopRow] };
+  }
+  if (stage === 0) {
+    return { text: `سلام ${name} 👋\n\n${(u.analyses || 0) > 0 ? 'قبلاً سایتت را تحلیل کرده بودی؛ اگر از آن موقع تغییری داده‌ای، دوباره بررسی کن.' : 'هنوز سایتت را تحلیل نکرده‌ای؛ همین ۶۰ ثانیه نشان می‌دهد چرا مشتری‌های گوگل سمت رقبایت می‌روند.'}\n\n🔍 فقط آدرس سایتت را بفرست و رایگان ببین:\n• نمره‌ی سرعت و سئو (موبایل و دسکتاپ)\n• مهم‌ترین مشکلاتی که باید اول حل شوند\n• پلنی که به وضعیتت می‌خورد`,
+      kb: [[{ text: '🔍 تحلیل رایگان سایت', callback_data: 'analyze' }], stopRow] };
+  }
+  if (stage === 1) {
+    const hours = Math.round((new Date(codeRow.expires_at) - Date.now()) / 3600e3);
+    return { text: `🎁 ${name}، یک کد تخفیف اختصاصی برایت ساختم\n\nکد: ${codeRow.code}\nتخفیف: ${faDigits(FU_PERCENT)}٪ روی همه‌ی پلن‌ها\n⏳ اعتبار: ${faDigits(hours)} ساعت (فقط برای خودت)\n\nپلن ${plan.name} با این کد: ${fmt(priceAfter(plan.price, FU_PERCENT))} تومان در ماه، به‌جای ${fmt(plan.price)}.\n\nروی دکمه‌ی زیر بزنی تخفیف خودکار روی سایت اعمال می‌شود؛ لازم نیست جایی وارد کنی.`,
+      kb: [[{ text: `🛒 خرید با ${faDigits(FU_PERCENT)}٪ تخفیف`, url: link(codeRow.code) }], [{ text: '🎫 قبل از خرید سؤال دارم', callback_data: 'support' }], stopRow] };
+  }
+  const left = Math.max(1, Math.round((new Date(u.fu_code_exp) - Date.now()) / 3600e3));
+  return { text: `⏰ ${name}، کد ${u.fu_code} حدود ${faDigits(left)} ساعت دیگر منقضی می‌شود\n\nبعد از آن نمی‌توانم این قیمت را برایت نگه دارم. اگر هنوز مطمئن نیستی، قبل از پرداخت بپرس: تیکت بزن تا همان روز جواب بدهیم.\n\nاین آخرین پیام من در این باره است.`,
+    kb: [[{ text: '🛒 استفاده از کد', url: link(u.fu_code) }], [{ text: '🎫 سؤال دارم', callback_data: 'support' }], stopRow] };
+}
+async function followupTick() {
+  if (!pool || !inSendWindow()) return 0;
+  const admins = ADMIN_IDS.filter(x => /^\d+$/.test(x)).map(Number);
+  const due = (await pool.query("SELECT * FROM bale_users WHERE fu_stop IS NULL AND fu_next IS NOT NULL AND fu_next <= now() AND NOT (chat_id = ANY($1::bigint[])) ORDER BY fu_next LIMIT 30", [admins])).rows;
+  let sent = 0;
+  for (const u of due) {
+    try {
+      if (u.fu_code) {   // کد استفاده شده = خرید انجام شده؛ پیگیری تمام
+        const c = (await pool.query('SELECT used_count FROM discounts WHERE code=$1', [u.fu_code])).rows[0];
+        if (c && c.used_count > 0) { await pool.query("UPDATE bale_users SET fu_stop='converted' WHERE chat_id=$1", [u.chat_id]); continue; }
+      }
+      if ((await pool.query("SELECT 1 FROM bale_tickets WHERE chat_id=$1 AND (status<>'closed' OR updated_at > now() - interval '24 hours') LIMIT 1", [u.chat_id])).rows.length) {
+        await pool.query("UPDATE bale_users SET fu_next = now() + interval '24 hours' WHERE chat_id=$1", [u.chat_id]); continue;   // گفتگوی انسانی در جریان است
+      }
+      if (u.fu_stage >= 2 && (!u.fu_code_exp || new Date(u.fu_code_exp) < Date.now())) { await pool.query("UPDATE bale_users SET fu_stop='done' WHERE chat_id=$1", [u.chat_id]); continue; }
+      let codeRow = null;
+      if (u.fu_stage === 1) { codeRow = await issueCode(u); u.fu_code = codeRow.code; u.fu_code_exp = codeRow.expires_at; }
+      const m = followupText(u, u.fu_stage, codeRow);
+      try { await bale('sendMessage', { chat_id: u.chat_id, text: m.text, ...keyboard(m.kb) }); }
+      catch (e) {
+        if (/403|block|forbidden|deactivated|not found|kicked/i.test(e.message)) { await pool.query("UPDATE bale_users SET fu_stop='blocked' WHERE chat_id=$1", [u.chat_id]); continue; }
+        await pool.query("UPDATE bale_users SET fu_next = now() + interval '2 hours' WHERE chat_id=$1", [u.chat_id]); log('followup send failed', e.message); continue;
+      }
+      sent++;
+      if (u.fu_stage === 0) await pool.query("UPDATE bale_users SET fu_stage=1, fu_next = now() + interval '22 hours' WHERE chat_id=$1", [u.chat_id]);
+      else if (u.fu_stage === 1) await pool.query("UPDATE bale_users SET fu_stage=2, fu_code=$2, fu_code_exp=$3, fu_next = $3::timestamptz - interval '10 hours' WHERE chat_id=$1", [u.chat_id, codeRow.code, codeRow.expires_at]);
+      else await pool.query("UPDATE bale_users SET fu_stage=3, fu_stop='done', fu_next=NULL WHERE chat_id=$1", [u.chat_id]);
+      await sleep(250);
+    } catch (e) { log('followup error', u.chat_id, e.message); await pool.query("UPDATE bale_users SET fu_next = now() + interval '3 hours' WHERE chat_id=$1", [u.chat_id]).catch(() => {}); }
+  }
+  return sent;
+}
+const FU_TICK_MS = Number(process.env.FU_TICK_SEC || 300) * 1000;
+function followupLoop() { setTimeout(function t() { followupTick().catch(e => log('followup', e.message)).finally(() => setTimeout(t, FU_TICK_MS)); }, Math.min(60e3, FU_TICK_MS)); }
+async function funnelStop(chatId) {
+  if (pool) await pool.query("UPDATE bale_users SET fu_stop='unsub' WHERE chat_id=$1 AND fu_stop IS NULL", [chatId]).catch(() => {});
+  return send(chatId, 'باشه، دیگر پیام تبلیغاتی نمی‌فرستم 🙏\nهر وقت خواستی از منو برگرد؛ تحلیل رایگان و پشتیبانی همیشه هست.', keyboard([backRow]));
+}
+async function funnelAdmin(chatId) {
+  const r = (await pool.query(`SELECT COUNT(*) FILTER (WHERE fu_next IS NOT NULL OR fu_stop IS NOT NULL)::int AS enrolled,
+      COUNT(*) FILTER (WHERE fu_stop IS NULL AND fu_next IS NOT NULL)::int AS active,
+      COUNT(*) FILTER (WHERE fu_stage >= 1)::int AS m1, COUNT(*) FILTER (WHERE fu_stage >= 2)::int AS m2, COUNT(*) FILTER (WHERE fu_stage >= 3)::int AS m3,
+      COUNT(fu_code)::int AS codes,
+      COUNT(*) FILTER (WHERE fu_stop='unsub')::int AS unsub, COUNT(*) FILTER (WHERE fu_stop='blocked')::int AS blocked, COUNT(*) FILTER (WHERE fu_stop='converted')::int AS converted
+    FROM bale_users`)).rows[0];
+  const used = (await pool.query("SELECT COUNT(*)::int AS c FROM bale_users u JOIN discounts d ON d.code = u.fu_code WHERE d.used_count > 0")).rows[0].c;
+  return send(chatId, `📣 قیف فروش\n\nوارد قیف شده: ${faDigits(r.enrolled)} (فعال: ${faDigits(r.active)})\nپیام ۱ ارسال‌شده: ${faDigits(r.m1)}\nپیام ۲ (کد تخفیف): ${faDigits(r.m2)}\nپیام ۳ (آخرین فرصت): ${faDigits(r.m3)}\n\n🎁 کد ساخته‌شده: ${faDigits(r.codes)} · استفاده‌شده: ${faDigits(used)}\n🔕 انصراف: ${faDigits(r.unsub)} · مسدود: ${faDigits(r.blocked)} · خرید: ${faDigits(r.converted)}\n\nکاربران قدیمی را با /backfill وارد قیف کن.`);
+}
+async function funnelBackfill(chatId) {
+  const admins = ADMIN_IDS.filter(x => /^\d+$/.test(x)).map(Number);
+  const r = await pool.query("UPDATE bale_users SET fu_next = now() + interval '1 hour' + random() * interval '16 hours' WHERE fu_next IS NULL AND fu_stop IS NULL AND NOT (chat_id = ANY($1::bigint[])) RETURNING chat_id", [admins]);
+  return send(chatId, `✅ ${faDigits(r.rows.length)} کاربر قدیمی وارد قیف شدند. پیام اول در ساعات مجاز (۹ تا ۲۲) و پراکنده در ۱۷ ساعت آینده ارسال می‌شود.`);
+}
+
 /* ---------- بخش مدیر ---------- */
 async function adminCommand(chatId, text) {
   const [cmd, ...rest] = text.split(/\s+/); const arg = rest.join(' ').trim();
+  if (cmd === '/funnel') return pool ? funnelAdmin(chatId) : send(chatId, 'برای قیف فروش دیتابیس لازم است.');
+  if (cmd === '/backfill') return pool ? funnelBackfill(chatId) : send(chatId, 'برای قیف فروش دیتابیس لازم است.');
   if (cmd === '/tickets') return adminTickets(chatId);
   if (cmd === '/ticket') return /^\d+$/.test(arg) ? viewTicket(chatId, Number(arg), true) : send(chatId, 'نمونه: /ticket 12');
   if (cmd === '/reply') { const m = arg.match(/^(\d+)\s+([\s\S]+)/); return m ? replyTicket(chatId, Number(m[1]), m[2]) : send(chatId, 'نمونه: /reply 12 متن پاسخ'); }
@@ -487,6 +602,7 @@ async function onCallback(cb) {
   switch (data) {
     case 'support': case 'contact': return askSupport(chatId);
     case 'mytickets': return showMyTickets(chatId);
+    case 'fu_stop': return funnelStop(chatId);
     case 'menu': return showMenu(chatId, cb.from?.first_name);
     case 'analyze': return askAnalyze(chatId);
     case 'plans': return showPlans(chatId);
@@ -521,7 +637,7 @@ async function onMessage(msg) {
     if (text === '/cancel') { ticketAwait.delete(String(chatId)); return send(chatId, 'لغو شد.'); }
     if (text && !text.startsWith('/')) { ticketAwait.delete(String(chatId)); return replyTicket(chatId, id, text); }
   }
-  if (isAdmin(msg.from?.id) && /^\/(stats|dashboard|leads|broadcast|tickets|ticket|reply|close)\b/.test(text)) { if (await adminCommand(chatId, text) !== false) return; }
+  if (isAdmin(msg.from?.id) && /^\/(stats|dashboard|leads|broadcast|tickets|ticket|reply|close|funnel|backfill)\b/.test(text)) { if (await adminCommand(chatId, text) !== false) return; }
   if (text === '/menu' || text === '/help') return showMenu(chatId, msg.from?.first_name);
   if (text === '/plans') return showPlans(chatId);
   if (text === '/analyze') return askAnalyze(chatId);
@@ -566,6 +682,7 @@ async function main() {
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' }).end('roshdink bale bot is running');
   });
   server.listen(PORT, () => log(`سرور روی پورت ${PORT}`));
+  if (FU_ON && pool) followupLoop();
 
   const useWebhook = MODE === 'webhook' || (MODE === 'auto' && PUBLIC_URL);
   if (useWebhook) {
