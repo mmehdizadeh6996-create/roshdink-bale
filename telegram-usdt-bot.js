@@ -288,7 +288,11 @@ const mainMenu = () => keyboard([
   [{ text: '👤 My subscription', callback_data: 'mysub' }, { text: '📋 My services', callback_data: 'svc' }],
   [{ text: '🎟 Promo code', callback_data: 'promo' }, { text: '💬 Contact support', callback_data: 'support' }],
 ]);
-const showMenu = (chatId, name) => { state.delete(chatId); const m = mainMenu(); if (isAdmin(chatId)) m.reply_markup.inline_keyboard.push([{ text: '🛠 Admin dashboard', callback_data: 'adm:dash' }]); return send(chatId, WELCOME(name), m); };
+const BOTTOM_BTNS = { analysis: '🔍 Site Analysis', services: '📋 My Services', plans: '📦 Plans', member: '👤 Membership' };
+const bottomKb = { reply_markup: { keyboard: [[{ text: BOTTOM_BTNS.analysis }, { text: BOTTOM_BTNS.services }], [{ text: BOTTOM_BTNS.plans }, { text: BOTTOM_BTNS.member }]], resize_keyboard: true, is_persistent: true, input_field_placeholder: 'Pick an option or type your website…' } };
+const kbShown = new Set();
+async function ensureBottomKb(chatId) { if (kbShown.has(chatId)) return; kbShown.add(chatId); await send(chatId, '⌨️ Quick menu is now at the bottom of your screen: Site Analysis · My Services · Plans · Membership.', bottomKb); }
+const showMenu = async (chatId, name) => { state.delete(chatId); const m = mainMenu(); if (isAdmin(chatId)) m.reply_markup.inline_keyboard.push([{ text: '🛠 Admin dashboard', callback_data: 'adm:dash' }]); await send(chatId, WELCOME(name), m); await ensureBottomKb(chatId); };
 
 const planText = p => `📦 ${p.name} plan — ${p.tag}\n💰 ${p.price} USDT / month\n` + p.feat.map(f => '• ' + f).join('\n');
 const auditText = `🎯 ${AUDIT.name} — ${AUDIT.tag}\n💰 ${AUDIT.price} USDT (one-time)\n` + AUDIT.feat.map(f => '• ' + f).join('\n');
@@ -1182,8 +1186,10 @@ async function onCallback(cb) {
 async function onMessage(msg) {
   const chatId = msg.chat?.id; if (!chatId || (msg.chat.type && msg.chat.type !== 'private')) return;
   const text = (msg.text || '').trim(), from = msg.from;
-  if (text.startsWith('/start')) { const payload = text.split(/\s+/)[1]; await touchUser(from, payload ? payload.slice(0, 60) : null); return showMenu(chatId, from?.first_name); }
+  if (text.startsWith('/start')) { kbShown.delete(chatId); const payload = text.split(/\s+/)[1]; await touchUser(from, payload ? payload.slice(0, 60) : null); return showMenu(chatId, from?.first_name); }
   await touchUser(from);
+  const bt = text === BOTTOM_BTNS.analysis ? 'a' : text === BOTTOM_BTNS.services ? 's' : text === BOTTOM_BTNS.plans ? 'p' : text === BOTTOM_BTNS.member ? 'm' : '';
+  if (bt) { state.delete(chatId); return bt === 'a' ? askAnalyze(chatId) : bt === 's' ? showServices(chatId) : bt === 'p' ? showPlans(chatId) : showSub(chatId); }
   const who = `${from?.first_name || ''} ${from?.username ? '@' + from.username : ''} (${chatId})`;
   if (isAdmin(from?.id)) {
     const key = adminAwait.get(String(chatId));
@@ -1236,7 +1242,7 @@ async function onMessage(msg) {
   if (st === 'analyze') return runAnalyze(chatId, text);
   if (!text) return;
   if (extractHost(text)) return runAnalyze(chatId, text);
-  return send(chatId, 'Choose an option from the menu 👇', mainMenu());
+  await send(chatId, 'Choose an option from the menu 👇', mainMenu()); return ensureBottomKb(chatId);
 }
 
 async function handleUpdate(u) {
