@@ -37,6 +37,11 @@ const NUM_ADMINS = ADMIN_IDS.filter(x => /^\d+$/.test(x));
 const NOT_ADMIN = NUM_ADMINS.length ? `chat_id NOT IN (${NUM_ADMINS.join(',')})` : 'TRUE';
 const FU_ON = (process.env.FOLLOWUPS || 'on').toLowerCase() !== 'off';
 const FU_ANALYSIS_H = Number(process.env.FU_ANALYSIS_HOURS || 24), FU_ORDER_H = Number(process.env.FU_ORDER_HOURS || 2), FU_TICK = Math.max(5, Number(process.env.FU_TICK_SEC || 600));
+const FUNNEL_PCT = Number(process.env.FUNNEL_PERCENT || 15), FUNNEL_CODE_H = Number(process.env.FUNNEL_CODE_HOURS || 48);
+const FUNNEL_GAPS_H = [4, 20, FUNNEL_CODE_H - 12];   // join→msg1, msg1→msg2 (personal code), msg2→msg3 (last call)
+const FU_SCALE = Number(process.env.FU_GAP_SCALE || 1), FU_WINDOW = process.env.FU_WINDOW || '6-19';   // send window in UTC hours (covers Europe, Middle East, parts of Asia)
+const gapMin = h => String(Math.max(0.02, h * 60 * FU_SCALE));
+const inSendWindow = () => { if (/^any$/i.test(FU_WINDOW)) return true; const [a, b] = FU_WINDOW.split('-').map(Number), h = new Date().getUTCHours(); return a <= b ? (h >= a && h < b) : (h >= a || h < b); };
 const esc = s => String(s ?? '').replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 const siteLink = (src = 'bot') => `${SITE_URL}/?utm_source=telegram&utm_medium=bot&s=${encodeURIComponent(src)}`;
 const usdt = micro => (Number(micro) / 1e6).toFixed(3);
@@ -67,7 +72,8 @@ const PLANS = [
 const AUDIT = { id: 'audit', name: 'SEO Audit', price: Number(process.env.PRICE_AUDIT || 19), tag: 'One-time, no subscription',
   feat: ['Technical SEO checks (indexing, robots, sitemap, HTTPS, speed)', 'On-page review (title, meta, headings, images)', 'Prioritized fix list + 30-day action plan', '10 keyword opportunities'] };
 const planById = id => (id === 'audit' ? AUDIT : PLANS.find(p => p.id === id));
-const priceFor = (plan, months) => (months === 3 ? Math.round(plan.price * 3 * 0.85 * 1000) / 1000 : plan.price);
+const priceFor = (plan, months, pct = 0) => { const full = months === 3 ? plan.price * 3 * 0.85 : plan.price; return Math.round(full * (1 - pct / 100) * 1000) / 1000; };
+const shortDate = d => new Date(d).toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
 
 /* ---------- storage (Postgres is required for payments) ---------- */
 let pool = null;
@@ -75,6 +81,7 @@ async function initStore() {
   if (!process.env.DATABASE_URL) { log('DATABASE_URL is not set: payments are DISABLED (no way to keep orders safely).'); return; }
   const { Pool } = require('pg');
   pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: /localhost|127\.0\.0\.1/.test(process.env.DATABASE_URL) ? false : { rejectUnauthorized: false } });
+  const hadFunnel = (await pool.query("SELECT 1 FROM information_schema.columns WHERE table_name='tg_users' AND column_name='fu_stage'")).rows.length > 0;
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tg_users (
       chat_id BIGINT PRIMARY KEY, first_name VARCHAR(100), username VARCHAR(100), source VARCHAR(60),
@@ -109,6 +116,17 @@ async function initStore() {
     ALTER TABLE tg_users ADD COLUMN IF NOT EXISTS last_issues TEXT;
     ALTER TABLE tg_users ADD COLUMN IF NOT EXISTS followup1_at TIMESTAMPTZ;
     ALTER TABLE tg_users ADD COLUMN IF NOT EXISTS unsubscribed BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE tg_users ADD COLUMN IF NOT EXISTS fu_stage INTEGER;
+    ALTER TABLE tg_users ADD COLUMN IF NOT EXISTS fu_due TIMESTAMPTZ;
+    ALTER TABLE tg_users ADD COLUMN IF NOT EXISTS fu_last_at TIMESTAMPTZ;
+    ALTER TABLE tg_orders ADD COLUMN IF NOT EXISTS code VARCHAR(20);
+    ALTER TABLE tg_orders ADD COLUMN IF NOT EXISTS discount_pct INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE IF NOT EXISTS tg_codes (
+      code VARCHAR(20) PRIMARY KEY, chat_id BIGINT NOT NULL, percent INTEGER NOT NULL, expires_at TIMESTAMPTZ NOT NULL,
+      used_at TIMESTAMPTZ, order_id INTEGER, created_at TIMESTAMPTZ DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS tg_codes_chat ON tg_codes(chat_id);
+    CREATE TABLE IF NOT EXISTS tg_seen_updates (update_id BIGINT PRIMARY KEY, seen_at TIMESTAMPTZ DEFAULT now());
     CREATE TABLE IF NOT EXISTS tg_deliveries (
       id SERIAL PRIMARY KEY, order_id INTEGER NOT NULL, chat_id BIGINT NOT NULL, kind VARCHAR(30) NOT NULL, label TEXT NOT NULL,
       due_at TIMESTAMPTZ NOT NULL, status VARCHAR(10) NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
@@ -119,27 +137,34 @@ async function initStore() {
     CREATE TABLE IF NOT EXISTS tg_sitedata (
       order_id INTEGER PRIMARY KEY, host TEXT, data TEXT, score INTEGER, updated_at TIMESTAMPTZ DEFAULT now()
     );`);
+  if (!hadFunnel) await pool.query('UPDATE tg_users SET fu_stage = 9');   // existing users stay out of the funnel until /backfill
+  await pool.query('ALTER TABLE tg_users ALTER COLUMN fu_stage SET DEFAULT 0');
 }
 const q = (sql, params) => { if (!pool) throw new Error('no database'); return pool.query(sql, params); };
 
 async function touchUser(from, source) {
   if (!from || !pool) return;
   await q(
-    `INSERT INTO tg_users(chat_id, first_name, username, source) VALUES($1,$2,$3,$4)
+    `INSERT INTO tg_users(chat_id, first_name, username, source, fu_stage, fu_due) VALUES($1,$2,$3,$4,0, now() + ($5 || ' minutes')::interval)
      ON CONFLICT (chat_id) DO UPDATE SET last_seen = now(), first_name = EXCLUDED.first_name, username = EXCLUDED.username, source = COALESCE(tg_users.source, EXCLUDED.source)`,
-    [from.id, (from.first_name || '').slice(0, 100), (from.username || '').slice(0, 100), source || null]).catch(e => log('touchUser', e.message));
+    [from.id, (from.first_name || '').slice(0, 100), (from.username || '').slice(0, 100), source || null, gapMin(FUNNEL_GAPS_H[0])]).catch(e => log('touchUser', e.message));
 }
 
 /* ---------- orders & activation ---------- */
+async function activeCode(chatId) {
+  if (!pool) return null;
+  return (await q('SELECT * FROM tg_codes WHERE chat_id=$1 AND used_at IS NULL AND expires_at > now() ORDER BY expires_at DESC LIMIT 1', [chatId])).rows[0] || null;
+}
 async function createOrder(chatId, plan, months, test = false) {
-  const base = test ? 0 : Math.round(priceFor(plan, months) * 1e6);          // micro-USDT
+  const dc = test ? null : await activeCode(chatId), pct = dc ? dc.percent : 0;
+  const base = test ? 0 : Math.round(priceFor(plan, months, pct) * 1e6);          // micro-USDT (personal code applied)
   for (let i = 0; i < 40; i++) {
     const amount = base + (1 + Math.floor(Math.random() * 999)) * 1000; // +0.001 … +0.999 USDT, unique per pending order
     try {
       await q("UPDATE tg_orders SET status='expired' WHERE chat_id=$1 AND status='pending'", [chatId]); // one open order per user
       const r = await q(
-        `INSERT INTO tg_orders(chat_id, plan, months, amount_micro, expires_at, test) VALUES($1,$2,$3,$4, now() + ($5 || ' minutes')::interval, $6) RETURNING *`,
-        [chatId, plan.id, months, amount, String(ORDER_TTL_MIN), test]);
+        `INSERT INTO tg_orders(chat_id, plan, months, amount_micro, expires_at, test, code, discount_pct) VALUES($1,$2,$3,$4, now() + ($5 || ' minutes')::interval, $6, $7, $8) RETURNING *`,
+        [chatId, plan.id, months, amount, String(ORDER_TTL_MIN), test, dc ? dc.code : null, pct]);
       return r.rows[0];
     } catch (e) { if (e.code !== '23505') throw e; }                 // amount already used by another pending order → retry
   }
@@ -149,6 +174,8 @@ async function createOrder(chatId, plan, months, test = false) {
 async function activate(order, txid, late) {
   const plan = planById(order.plan);
   const isAudit = order.plan === 'audit';
+  if (order.code) await q('UPDATE tg_codes SET used_at = now(), order_id = $2 WHERE code = $1 AND used_at IS NULL', [order.code, order.id]).catch(e => log('code use', e.message));
+  if (!order.test) await q('UPDATE tg_users SET fu_stage = 9 WHERE chat_id = $1', [order.chat_id]).catch(e => log('funnel stop', e.message));
   let until = '';
   if (!isAudit) {
     const r = await q(
@@ -170,7 +197,7 @@ async function activate(order, txid, late) {
     keyboard([[{ text: '📋 My services', callback_data: 'svc' }], backRow]));
   if (renewal) await startFulfilment(order.chat_id, order.id, order.site).catch(e => log('schedule', e.message));
   const u = (await q('SELECT first_name, username FROM tg_users WHERE chat_id=$1', [order.chat_id])).rows[0] || {};
-  await notifyAdmins(`💰 ${order.test ? '🧪 TEST ' : ''}New payment${late ? ' (LATE – order had expired, please double-check)' : ''}\nPlan: ${plan.name}${isAudit ? ' (one-time)' : ' × ' + order.months + ' mo'}\nAmount: ${usdt(order.amount_micro)} USDT\nUser: ${u.first_name || ''} ${u.username ? '@' + u.username : ''} (${order.chat_id})\nOrder #${order.id}\nTX: ${txid}\nhttps://tronscan.org/#/transaction/${txid}\nManage services: /customer ${order.chat_id}`);
+  await notifyAdmins(`💰 ${order.test ? '🧪 TEST ' : ''}New payment${late ? ' (LATE – order had expired, please double-check)' : ''}\nPlan: ${plan.name}${isAudit ? ' (one-time)' : ' × ' + order.months + ' mo'}\nAmount: ${usdt(order.amount_micro)} USDT${order.code ? ` (code ${order.code}, −${order.discount_pct}%)` : ''}\nUser: ${u.first_name || ''} ${u.username ? '@' + u.username : ''} (${order.chat_id})\nOrder #${order.id}\nTX: ${txid}\nhttps://tronscan.org/#/transaction/${txid}\nManage services: /customer ${order.chat_id}`);
 }
 
 /* ---------- on-chain verification (TronGrid) ---------- */
@@ -239,25 +266,32 @@ const showMenu = (chatId, name) => { state.delete(chatId); return send(chatId, W
 
 const planText = p => `📦 ${p.name} plan — ${p.tag}\n💰 ${p.price} USDT / month\n` + p.feat.map(f => '• ' + f).join('\n');
 const auditText = `🎯 ${AUDIT.name} — ${AUDIT.tag}\n💰 ${AUDIT.price} USDT (one-time)\n` + AUDIT.feat.map(f => '• ' + f).join('\n');
-const showPlans = chatId => send(chatId, [auditText, ...PLANS.map(planText)].join('\n\n──────────\n\n') + '\n\n✨ Pay for 3 months and save 15%.',
-  keyboard([[{ text: `🎯 Get the SEO Audit — ${AUDIT.price} USDT`, callback_data: 'd:audit:1' }], [{ text: '💳 Buy a plan with USDT', callback_data: 'buy' }], backRow]));
+const priceLbl = (plan, months, pct) => pct ? `${priceFor(plan, months, pct)} USDT (−${pct}%)` : `${priceFor(plan, months)} USDT`;
+const codeBanner = dc => dc ? `🎁 Your personal ${dc.percent}% code ${dc.code} is applied automatically at checkout (valid until ${shortDate(dc.expires_at)}).\n\n` : '';
+async function showPlans(chatId) {
+  const dc = await activeCode(chatId).catch(() => null), pct = dc ? dc.percent : 0;
+  return send(chatId, codeBanner(dc) + [auditText, ...PLANS.map(planText)].join('\n\n──────────\n\n') + '\n\n✨ Pay for 3 months and save 15%.',
+    keyboard([[{ text: `🎯 Get the SEO Audit — ${priceLbl(AUDIT, 1, pct)}`, callback_data: 'd:audit:1' }], [{ text: '💳 Buy a plan with USDT', callback_data: 'buy' }], backRow]));
+}
 
 async function showBuy(chatId) {
   if (!pool || !WALLET_OK) return send(chatId, 'Payments are temporarily unavailable. Please contact support.', keyboard([[{ text: '💬 Contact support', callback_data: 'support' }], backRow]));
-  return send(chatId, 'Choose what you need:', keyboard([[{ text: `🎯 SEO Audit — ${AUDIT.price} USDT (one-time)`, callback_data: 'd:audit:1' }], ...PLANS.map(p => [{ text: `${p.name} — ${p.price} USDT/mo`, callback_data: `p:${p.id}` }]), backRow]));
+  const dc = await activeCode(chatId), pct = dc ? dc.percent : 0;
+  return send(chatId, codeBanner(dc) + 'Choose what you need:', keyboard([[{ text: `🎯 SEO Audit — ${priceLbl(AUDIT, 1, pct)} (one-time)`, callback_data: 'd:audit:1' }], ...PLANS.map(p => [{ text: `${p.name} — ${priceLbl(p, 1, pct).replace(' USDT', ' USDT/mo')}`, callback_data: `p:${p.id}` }]), backRow]));
 }
 async function showDuration(chatId, planId) {
   const p = planById(planId); if (!p) return;
-  return send(chatId, `${p.name} plan — how long?`, keyboard([
-    [{ text: `1 month — ${priceFor(p, 1)} USDT`, callback_data: `d:${p.id}:1` }],
-    [{ text: `3 months — ${priceFor(p, 3)} USDT (save 15%)`, callback_data: `d:${p.id}:3` }],
+  const dc = await activeCode(chatId), pct = dc ? dc.percent : 0;
+  return send(chatId, codeBanner(dc) + `${p.name} plan — how long?`, keyboard([
+    [{ text: `1 month — ${priceLbl(p, 1, pct)}`, callback_data: `d:${p.id}:1` }],
+    [{ text: `3 months — ${priceLbl(p, 3, pct)} (save 15% more)`, callback_data: `d:${p.id}:3` }],
     [{ text: '⬅️ Back', callback_data: 'buy' }]]));
 }
 async function startOrder(chatId, planId, months, test = false) {
   const p = planById(planId); if (!p || ![1, 3].includes(months) || !pool || (!WALLET_OK && !test)) return;
   const o = await createOrder(chatId, p, months, test);
   const text = `🧾 <b>${test ? '🧪 TEST ' : ''}Order #${o.id}</b> — ${esc(p.name)} ${p.id === 'audit' ? '(one-time)' : '× ' + months + ' month' + (months > 1 ? 's' : '')}\n\n` +
-    `Send exactly:\n<code>${usdt(o.amount_micro)}</code> USDT\n\nNetwork: <b>TRON (TRC-20)</b> only\nTo address:\n<code>${WALLET_OK ? WALLET : 'TEST-MODE'}</code>\n\n` +
+    (o.code ? `🎁 Code ${esc(o.code)} applied: −${o.discount_pct}%\n` : '') + `Send exactly:\n<code>${usdt(o.amount_micro)}</code> USDT\n\nNetwork: <b>TRON (TRC-20)</b> only\nTo address:\n<code>${WALLET_OK ? WALLET : 'TEST-MODE'}</code>\n\n` +
     `⚠️ The amount must match <b>exactly</b> (all decimals) — that's how we recognise your payment. Other networks or amounts can't be matched automatically.\n` +
     `⏳ Valid for ${ORDER_TTL_MIN} minutes. Your order activates automatically about a minute after the transfer is confirmed.`;
   return send(chatId, text, { parse_mode: 'HTML', ...keyboard([...(test ? [[{ text: '🧪 Simulate payment (test)', callback_data: `tst:${o.id}` }]] : []), [{ text: '✅ I\'ve paid — check now', callback_data: `chk:${o.id}` }], [{ text: '✖️ Cancel order', callback_data: `can:${o.id}` }]]) });
@@ -321,7 +355,7 @@ async function runAnalyze(chatId, text) {
     const issues = (m.topIssues || []).slice(0, 3).map(i => '• ' + i.title).join('\n');
     const out = `📊 Analysis for ${data.host || host}\n\n📱 Mobile\n${icon(ms.performance)} Speed: ${sc(ms.performance)}\n${icon(ms.seo)} SEO: ${sc(ms.seo)}\n${icon(ms.bestPractices)} Best practices: ${sc(ms.bestPractices)}\n${icon(ms.accessibility)} Accessibility: ${sc(ms.accessibility)}\n\n💻 Desktop\n${icon(ds.performance)} Speed: ${sc(ds.performance)}   ${icon(ds.seo)} SEO: ${sc(ds.seo)}\n\n` +
       (issues ? `🔧 Top things to improve:\n${issues}\n\n` : '') + `✅ Suggested plan: ${rec.name}`;
-    if (pool) await q('UPDATE tg_users SET analyzed_at = now(), last_domain = $2, last_score = $3, last_issues = $4, followup1_at = NULL WHERE chat_id = $1', [chatId, data.host || host, overall, (m.topIssues || []).slice(0, 3).map(i => i.title).join(' | ')]).catch(e => log('save analysis', e.message));
+    if (pool) await q('UPDATE tg_users SET analyzed_at = now(), last_domain = $2, last_score = $3, last_issues = $4, followup1_at = NULL, fu_due = CASE WHEN fu_stage = 0 THEN now() + $5::float8 * INTERVAL \'1 minute\' ELSE fu_due END WHERE chat_id = $1', [chatId, data.host || host, overall, (m.topIssues || []).slice(0, 3).map(i => i.title).join(' | '), Number(gapMin(2))]).catch(e => log('save analysis', e.message));
     return send(chatId, out, keyboard([[{ text: `🎯 Full SEO Audit — ${AUDIT.price} USDT`, callback_data: 'd:audit:1' }], [{ text: '📦 See plans', callback_data: 'plans' }, { text: '💳 Buy with USDT', callback_data: 'buy' }], backRow]));
   } catch (e) {
     log('analyze failed', host, e.message);
@@ -784,26 +818,14 @@ async function showDeliveries(chatId) {
 async function runFollowups() {
   if (!pool) return 0;
   let sent = 0;
-  const a = await q(`UPDATE tg_users SET followup1_at = now() WHERE chat_id IN (
-      SELECT chat_id FROM tg_users WHERE analyzed_at IS NOT NULL AND followup1_at IS NULL AND NOT unsubscribed
-        AND analyzed_at < now() - ($1 || ' hours')::interval AND analyzed_at > now() - interval '72 hours'
-        AND ${NOT_ADMIN}
-        AND chat_id NOT IN (SELECT chat_id FROM tg_orders WHERE status IN ('paid','pending') AND NOT test)
-        AND chat_id NOT IN (SELECT chat_id FROM tg_subs WHERE expires_at > now()) LIMIT 20)
-    RETURNING chat_id, last_domain, last_score, last_issues`, [String(FU_ANALYSIS_H)]);
-  for (const x of a.rows) {
-    const issues = String(x.last_issues || '').split(' | ').filter(Boolean).map(i => '• ' + i).join('\n');
-    await send(x.chat_id, `👋 Your analysis of ${x.last_domain} is ready to act on.\n` + (x.last_score != null ? `Overall score: ${x.last_score}/100.\n` : '') + (issues ? `\nBiggest things holding it back:\n${issues}\n` : '') +
-      `\nWant us to fix them? The one-time SEO Audit (${AUDIT.price} USDT) gives you a prioritized action list within minutes.`,
-      keyboard([[{ text: `🎯 Get the SEO Audit — ${AUDIT.price} USDT`, callback_data: 'd:audit:1' }], [{ text: '📦 See plans', callback_data: 'plans' }], [{ text: '🔕 Stop reminders', callback_data: 'stop' }]]));
-    sent++; await sleep(100);
-  }
+  if (!inSendWindow()) return sent;
+  sent += await runFunnel();
   const b = await q(`UPDATE tg_orders SET followup_at = now() WHERE id IN (
       SELECT MAX(id) FROM tg_orders WHERE status = 'expired' AND txid IS NULL AND NOT test AND followup_at IS NULL
         AND expires_at < now() - ($1 || ' hours')::interval AND expires_at > now() - interval '48 hours'
         AND chat_id NOT IN (SELECT chat_id FROM tg_orders WHERE status IN ('paid','pending') AND NOT test)
         AND chat_id NOT IN (SELECT chat_id FROM tg_orders WHERE followup_at IS NOT NULL)
-        AND chat_id NOT IN (SELECT chat_id FROM tg_users WHERE followup1_at > now() - interval '24 hours')
+        AND chat_id NOT IN (SELECT chat_id FROM tg_users WHERE fu_last_at > now() - interval '24 hours')
         AND chat_id IN (SELECT chat_id FROM tg_users WHERE NOT unsubscribed AND ${NOT_ADMIN})
       GROUP BY chat_id LIMIT 20)
     RETURNING chat_id, plan`, [String(FU_ORDER_H)]);
@@ -814,9 +836,97 @@ async function runFollowups() {
   }
   return sent;
 }
+
+/* ---------- sales funnel: 3 messages + personal USDT discount code ---------- */
+const CODE_ALPHA = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+function newCode() { let s = 'T-'; for (let i = 0; i < 6; i++) s += CODE_ALPHA[crypto.randomInt(CODE_ALPHA.length)]; return s; }
+async function issueCode(chatId) {
+  const ex = await activeCode(chatId); if (ex) return ex;
+  for (let i = 0; i < 5; i++) {
+    try { return (await q("INSERT INTO tg_codes(code, chat_id, percent, expires_at) VALUES($1,$2,$3, now() + $4::float8 * INTERVAL '1 minute') RETURNING *", [newCode(), chatId, FUNNEL_PCT, Number(gapMin(FUNNEL_CODE_H))])).rows[0]; }
+    catch (e) { if (e.code !== '23505') throw e; }
+  }
+  throw new Error('could not issue code');
+}
+const funnelKb = rows => ({ parse_mode: 'HTML', ...keyboard([...rows, [{ text: '🔕 Stop reminders', callback_data: 'stop' }]]) });
+async function funnelMessage(stage, u) {
+  const name = esc(u.first_name || '');
+  if (stage === 0) {
+    if (u.last_domain) {
+      const issues = String(u.last_issues || '').split(' | ').filter(Boolean).map(i => '• ' + esc(i)).join('\n');
+      return { text: `👋 ${name ? name + ', your' : 'Your'} analysis of <b>${esc(u.last_domain)}</b> is ready to act on.\n` + (u.last_score != null ? `Overall score: <b>${u.last_score}/100</b>.\n` : '') + (issues ? `\nBiggest things holding it back:\n${issues}\n` : '') +
+        `\nThese are usually quick fixes. The one-time SEO Audit (${AUDIT.price} USDT) turns them into a prioritized 30-day action plan, delivered here within minutes.`,
+        extra: funnelKb([[{ text: `🎯 Get the SEO Audit — ${AUDIT.price} USDT`, callback_data: 'd:audit:1' }], [{ text: '📦 See plans', callback_data: 'plans' }]]) };
+    }
+    return { text: `👋 ${name ? name + ', quick' : 'Quick'} tip: most websites lose visitors to 3–4 technical issues that are easy to fix — slow loading, missing titles, weak mobile layout.\n\nSend me your website address and I'll check it for free in about 30 seconds, no payment needed.`,
+      extra: funnelKb([[{ text: '🔍 Analyze my site free', callback_data: 'analyze' }], [{ text: '📦 See plans', callback_data: 'plans' }]]) };
+  }
+  if (stage === 1) {
+    const dc = await issueCode(u.chat_id);
+    return { text: `🎁 <b>A personal gift for you${name ? ', ' + name : ''}</b>\n\nYour code: <code>${dc.code}</code> — <b>${dc.percent}% off</b> any plan or the SEO Audit.\nIt is applied automatically at checkout; nothing to type.\n\n` +
+      `• SEO Audit: ${AUDIT.price} → <b>${priceFor(AUDIT, 1, dc.percent)} USDT</b>\n• Start plan: ${PLANS[0].price} → <b>${priceFor(PLANS[0], 1, dc.percent)} USDT</b>\n• Growth plan: ${PLANS[1].price} → <b>${priceFor(PLANS[1], 1, dc.percent)} USDT</b>\n\n` +
+      `⏳ Valid until ${shortDate(dc.expires_at)} — after that it expires and can't be reissued.\nPaying is simple: send USDT on the TRON network and your order activates automatically about a minute after confirmation.`,
+      extra: funnelKb([[{ text: `🎁 Use my ${dc.percent}% off`, callback_data: 'buy' }], [{ text: '📦 See plans', callback_data: 'plans' }]]) };
+  }
+  const dc = await activeCode(u.chat_id);
+  const left = dc ? (new Date(dc.expires_at) - Date.now()) / 3600e3 : 0;
+  if (!dc || left < 0.9) return null;                       // used, expired or about to — nothing honest left to say
+  return { text: `⏰ Your <b>${dc.percent}% discount</b> (<code>${dc.code}</code>) expires in about <b>${Math.round(left)} hours</b>.\n\nAfter that the regular prices apply. If anything about paying with USDT is unclear — network, amount, wallet — just ask here and we'll walk you through it.`,
+    extra: funnelKb([[{ text: `💳 Buy now — ${dc.percent}% off`, callback_data: 'buy' }], [{ text: '💬 Ask a question', callback_data: 'support' }]]) };
+}
+async function runFunnel() {
+  if (!pool) return 0;
+  const r = await q(`UPDATE tg_users SET fu_stage = fu_stage + 1, fu_last_at = now(),
+      fu_due = CASE fu_stage WHEN 0 THEN now() + $1::float8 * INTERVAL '1 minute' WHEN 1 THEN now() + $2::float8 * INTERVAL '1 minute' ELSE NULL END
+    WHERE chat_id IN (
+      SELECT chat_id FROM tg_users WHERE fu_stage IN (0,1,2) AND fu_due <= now() AND NOT unsubscribed AND ${NOT_ADMIN}
+        AND last_seen < now() - ($3::float8) * INTERVAL '1 minute'
+        AND chat_id NOT IN (SELECT chat_id FROM tg_orders WHERE status IN ('paid','pending') AND NOT test)
+        AND chat_id NOT IN (SELECT chat_id FROM tg_subs WHERE expires_at > now())
+      ORDER BY fu_due LIMIT 25)
+    RETURNING chat_id, first_name, fu_stage, last_domain, last_score, last_issues`, [Number(gapMin(FUNNEL_GAPS_H[1])), Number(gapMin(FUNNEL_GAPS_H[2])), Math.max(0.02, 20 * FU_SCALE)]);
+  let sent = 0;
+  for (const u of r.rows) {
+    try {
+      const m = await funnelMessage(u.fu_stage - 1, u);
+      if (!m) continue;
+      await tg('sendMessage', { chat_id: u.chat_id, text: m.text, disable_web_page_preview: true, ...m.extra });
+      sent++;
+    } catch (e) {
+      log('funnel send', u.chat_id, e.message);
+      if (/blocked|deactivated|chat not found|kicked/i.test(e.message)) await q('UPDATE tg_users SET unsubscribed = true WHERE chat_id=$1', [u.chat_id]).catch(() => {});
+    }
+    await sleep(100);
+  }
+  return sent;
+}
+async function funnelAdmin(chatId) {
+  const st = (await q('SELECT COALESCE(fu_stage, -1) AS s, COUNT(*)::int AS c FROM tg_users WHERE NOT unsubscribed GROUP BY 1 ORDER BY 1')).rows;
+  const label = { 0: 'waiting for message 1', 1: 'got message 1 (value)', 2: 'got message 2 (code)', 3: 'finished (got last call)', 9: 'bought / legacy (not in funnel)' };
+  const c = (await q('SELECT COUNT(*)::int AS issued, COUNT(used_at)::int AS used FROM tg_codes')).rows[0];
+  const rev = (await q("SELECT COUNT(*)::int AS n, COALESCE(SUM(amount_micro),0)::bigint AS m FROM tg_orders WHERE status='paid' AND code IS NOT NULL AND NOT test")).rows[0];
+  const unsub = (await q('SELECT COUNT(*)::int AS c FROM tg_users WHERE unsubscribed')).rows[0].c;
+  return send(chatId, `📈 Sales funnel\n\n` + st.map(x => `${label[x.s] || 'stage ' + x.s}: ${x.c}`).join('\n') + `\nUnsubscribed: ${unsub}\n\n🎁 Codes issued: ${c.issued} · used: ${c.used}\n💰 Revenue from code orders: ${usdt(rev.m)} USDT (${rev.n} orders)\n\nSend window (UTC): ${FU_WINDOW} · code ${FUNNEL_PCT}% / ${FUNNEL_CODE_H}h\n/backfill — enrol older users who never bought`);
+}
+async function funnelBackfill(chatId) {
+  const r = await q(`UPDATE tg_users SET fu_stage = 0, fu_due = now() + (random() * 600) * INTERVAL '1 minute'
+    WHERE fu_stage = 9 AND fu_last_at IS NULL AND NOT unsubscribed AND ${NOT_ADMIN}
+      AND chat_id NOT IN (SELECT chat_id FROM tg_orders WHERE status='paid' AND NOT test)
+      AND chat_id NOT IN (SELECT chat_id FROM tg_subs WHERE expires_at > now())`);
+  return send(chatId, `Enrolled ${r.rowCount} older users. Their first message is spread over the next ~10 hours, inside the send window.`);
+}
+const seenUpdates = new Set();
+async function firstSeen(u) {
+  if (u.update_id == null) return true;
+  if (seenUpdates.has(u.update_id)) return false;
+  seenUpdates.add(u.update_id); if (seenUpdates.size > 2000) seenUpdates.delete(seenUpdates.values().next().value);
+  if (!pool) return true;
+  try { return (await pool.query('INSERT INTO tg_seen_updates(update_id) VALUES($1) ON CONFLICT DO NOTHING', [u.update_id])).rowCount > 0; } catch { return true; }
+}
 async function followupLoop() {
   await sleep(Math.min(60, FU_TICK) * 1000);
   for (;;) {
+    q("DELETE FROM tg_seen_updates WHERE seen_at < now() - interval '2 days'").catch(() => {});
     try { const n = await runFollowups(); if (n) log('follow-ups sent', n); } catch (e) { log('followups', e.message); }
     await sleep(FU_TICK * 1000);
   }
@@ -919,6 +1029,8 @@ async function adminCommand(chatId, text) {
     await send(chatId, r.rows.length ? `Delivery #${r.rows[0].id} will be retried now.` : 'Not found (or already delivered).'); fulfilTick().catch(e => log('fulfil', e.message)); return;
   }
   if (cmd === '/orders') return adminLists(chatId, 'orders');
+  if (cmd === '/funnel') return funnelAdmin(chatId);
+  if (cmd === '/backfill') return funnelBackfill(chatId);
   if (cmd === '/followups') { const n = await runFollowups(); return send(chatId, `Follow-ups sent: ${n}`); }
   if (cmd === '/customers') return adminCustomers(chatId);
   if (cmd === '/customer') return /^\d+$/.test(rest[0] || '') ? adminCustomer(chatId, rest[0]) : send(chatId, 'Usage: /customer <chat_id>');
@@ -981,7 +1093,7 @@ async function onMessage(msg) {
       if (text === '/cancel') { adminAwait.delete(String(chatId)); return send(chatId, 'Cancelled.'); }
       if (text && !text.startsWith('/')) { adminAwait.delete(String(chatId)); pendingBroadcast.set(String(chatId), { text, seg: key }); const n = (await segIds(key)).length; return send(chatId, `Preview (to ${n} users, “${SEGMENTS[key].label}”):\n\n${text}`, keyboard([[{ text: '✅ Send', callback_data: 'bc_yes' }, { text: '✖️ Cancel', callback_data: 'bc_no' }]])); }
     }
-    if (/^\/(dashboard|stats|orders|testaudit|deliveries|runnow|redeliver|followups|customers|customer|check|activate|testpay|testreset)\b/.test(text)) { if (await adminCommand(chatId, text) !== false) return; }
+    if (/^\/(dashboard|stats|orders|testaudit|deliveries|runnow|redeliver|followups|funnel|backfill|customers|customer|check|activate|testpay|testreset)\b/.test(text)) { if (await adminCommand(chatId, text) !== false) return; }
     // admin replies to a forwarded customer message: "/reply <chat_id> text"
     const m = text.match(/^\/reply\s+(\d+)\s+([\s\S]+)/); if (m) { await send(m[1], m[2]); return send(chatId, 'Sent.'); }
   }
@@ -1028,7 +1140,7 @@ async function onMessage(msg) {
 }
 
 async function handleUpdate(u) {
-  try { if (u.callback_query) await onCallback(u.callback_query); else if (u.message) await onMessage(u.message); }
+  try { if (!(await firstSeen(u))) return; if (u.callback_query) await onCallback(u.callback_query); else if (u.message) await onMessage(u.message); }
   catch (e) {
     log('update error', e.message);
     const cid = u.callback_query?.message?.chat?.id || u.message?.chat?.id;
@@ -1069,4 +1181,4 @@ async function main() {
   startPolling();
 }
 if (require.main === module || process.env.PLATFORM === 'telegram') main().catch(e => { console.error(e); process.exit(1); });
-module.exports = { checkPayments, createOrder, activate, isPrivateIp, mdToHtml, scheduleFor };
+module.exports = { runFunnel, issueCode, activeCode, funnelMessage, checkPayments, createOrder, activate, isPrivateIp, mdToHtml, scheduleFor };
