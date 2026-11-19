@@ -288,7 +288,7 @@ const mainMenu = () => keyboard([
   [{ text: '👤 My subscription', callback_data: 'mysub' }, { text: '📋 My services', callback_data: 'svc' }],
   [{ text: '🎟 Promo code', callback_data: 'promo' }, { text: '💬 Contact support', callback_data: 'support' }],
 ]);
-const showMenu = (chatId, name) => { state.delete(chatId); return send(chatId, WELCOME(name), mainMenu()); };
+const showMenu = (chatId, name) => { state.delete(chatId); const m = mainMenu(); if (isAdmin(chatId)) m.reply_markup.inline_keyboard.push([{ text: '🛠 Admin dashboard', callback_data: 'adm:dash' }]); return send(chatId, WELCOME(name), m); };
 
 const planText = p => `📦 ${p.name} plan — ${p.tag}\n💰 ${p.price} USDT / month\n` + p.feat.map(f => '• ' + f).join('\n');
 const auditText = `🎯 ${AUDIT.name} — ${AUDIT.tag}\n💰 ${AUDIT.price} USDT (one-time)\n` + AUDIT.feat.map(f => '• ' + f).join('\n');
@@ -943,7 +943,7 @@ async function funnelAdmin(chatId) {
   const c = (await q('SELECT COUNT(*)::int AS issued, COUNT(used_at)::int AS used FROM tg_codes')).rows[0];
   const rev = (await q("SELECT COUNT(*)::int AS n, COALESCE(SUM(amount_micro),0)::bigint AS m FROM tg_orders WHERE status='paid' AND code IS NOT NULL AND NOT test")).rows[0];
   const unsub = (await q('SELECT COUNT(*)::int AS c FROM tg_users WHERE unsubscribed')).rows[0].c;
-  return send(chatId, `📈 Sales funnel\n\n` + st.map(x => `${label[x.s] || 'stage ' + x.s}: ${x.c}`).join('\n') + `\nUnsubscribed: ${unsub}\n\n🎁 Codes issued: ${c.issued} · used: ${c.used}\n💰 Revenue from code orders: ${usdt(rev.m)} USDT (${rev.n} orders)\n\nSend window (UTC): ${FU_WINDOW} · code ${FUNNEL_PCT}% / ${FUNNEL_CODE_H}h\n/backfill — enrol older users who never bought`);
+  return send(chatId, `📈 Sales funnel\n\n` + st.map(x => `${label[x.s] || 'stage ' + x.s}: ${x.c}`).join('\n') + `\nUnsubscribed: ${unsub}\n\n🎁 Codes issued: ${c.issued} · used: ${c.used}\n💰 Revenue from code orders: ${usdt(rev.m)} USDT (${rev.n} orders)\n\nSend window (UTC): ${FU_WINDOW} · code ${FUNNEL_PCT}% / ${FUNNEL_CODE_H}h\n/backfill — enrol older users who never bought`, keyboard([[{ text: '👥 Enrol older users who never bought', callback_data: 'adm:backfill' }], [{ text: '🎟 Promo codes', callback_data: 'adm:promo' }], [{ text: '🔙 Dashboard', callback_data: 'adm:dash' }]]));
 }
 async function funnelBackfill(chatId) {
   const r = await q(`UPDATE tg_users SET fu_stage = 0, fu_due = now() + (random() * 600) * INTERVAL '1 minute'
@@ -999,8 +999,10 @@ async function promoAdmin(chatId, text) {
   }
   if (sub === 'list' || !sub) {
     const r = (await q('SELECT * FROM tg_promos ORDER BY created_at DESC LIMIT 25')).rows;
-    if (!r.length) return send(chatId, PROMO_HELP);
-    return send(chatId, '🎟 Promo codes\n\n' + r.map(p => `${p.active ? '🟢' : '⚪️'} ${p.code} — ${p.percent}%${p.plan ? ' · ' + p.plan : ''}${p.auto ? ' · auto' : ''} · used ${p.used_count}${p.max_uses ? '/' + p.max_uses : ''}${p.expires_at ? ' · until ' + shortDate(p.expires_at) : ''}`).join('\n') + '\n\n/promo create … · /promo off CODE · /promo on CODE');
+    const rows = [...r.slice(0, 10).map(p => [{ text: `${p.active ? '🟢 ON' : '⚪️ OFF'} · ${p.code} · ${p.percent}% — tap to ${p.active ? 'turn off' : 'turn on'}`, callback_data: `adm:pt:${p.code}` }]),
+      [{ text: '➕ Black Friday: 30% off everyone, 5 days', callback_data: 'adm:pn:bf' }], [{ text: '🔙 Dashboard', callback_data: 'adm:dash' }]];
+    if (!r.length) return send(chatId, PROMO_HELP, keyboard(rows));
+    return send(chatId, '🎟 Promo codes\n\n' + r.map(p => `${p.active ? '🟢' : '⚪️'} ${p.code} — ${p.percent}%${p.plan ? ' · ' + p.plan : ''}${p.auto ? ' · auto' : ''} · used ${p.used_count}${p.max_uses ? '/' + p.max_uses : ''}${p.expires_at ? ' · until ' + shortDate(p.expires_at) : ''}`).join('\n') + '\n\nCustom codes: /promo create CODE PERCENT [plan=…] [days=N] [max=N] [auto]', keyboard(rows));
   }
   if (sub === 'off' || sub === 'on') {
     const code = String(a[1] || '').toUpperCase();
@@ -1035,9 +1037,12 @@ async function dashboard(chatId) {
     q(`SELECT COALESCE(source,'direct') AS src, COUNT(*)::int AS n, COUNT(*) FILTER (WHERE analyzed_at IS NOT NULL)::int AS a, COUNT(*) FILTER (WHERE chat_id IN (SELECT chat_id FROM tg_orders WHERE status='paid' AND NOT test))::int AS p FROM tg_users WHERE ${NOT_ADMIN} GROUP BY 1 ORDER BY n DESC LIMIT 8`)]);
   const a = u.rows[0], b = o.rows[0], f = fu.rows[0], pct = (x, y) => (y ? Math.round(100 * x / y) + '%' : '—');
   const funnel = `🔻 Funnel (admins excluded)\nStarted: ${f.starts}\nRan analysis: ${f.analyzed} (${pct(f.analyzed, f.starts)})\nStarted checkout: ${f.ordered} (${pct(f.ordered, f.starts)})\nPaid: ${f.paid} (${pct(f.paid, f.starts)})` + (so.rows.length ? '\n\n📣 Sources (started · analysed · paid)\n' + so.rows.map(x => `${x.src}: ${x.n} · ${x.a} · ${x.p}`).join('\n') : '');
-  const text = `📊 Dashboard\n\n👥 Users: ${a.total}\n🆕 Today: ${a.today}   🗓 7 days: ${a.week}\n🟢 Active (24h): ${a.active}\n\n✅ Active subscribers: ${s.rows[0].c}\n💰 Paid orders: ${b.paid}   ⏳ Pending: ${b.pending}\n💵 Revenue: ${usdt(b.revenue)} USDT\n\n${funnel}\n\nWallet: ${WALLET_OK ? WALLET : '⚠️ NOT SET'}`;
+  const prm = (await q("SELECT COUNT(*) FILTER (WHERE active AND (expires_at IS NULL OR expires_at > now()))::int AS live, COALESCE(SUM(used_count),0)::int AS used FROM tg_promos")).rows[0];
+  const pc = (await q('SELECT COUNT(*)::int AS issued, COUNT(used_at)::int AS used FROM tg_codes')).rows[0];
+  const text = `📊 Dashboard\n\n👥 Users: ${a.total}\n🆕 Today: ${a.today}   🗓 7 days: ${a.week}\n🟢 Active (24h): ${a.active}\n\n✅ Active subscribers: ${s.rows[0].c}\n💰 Paid orders: ${b.paid}   ⏳ Pending: ${b.pending}\n💵 Revenue: ${usdt(b.revenue)} USDT\n\n${funnel}\n\n🎟 Promo codes live: ${prm.live} · redeemed: ${prm.used}\n🎁 Personal codes: ${pc.issued} sent · ${pc.used} used\n\nWallet: ${WALLET_OK ? WALLET : '⚠️ NOT SET'}`;
   return send(chatId, text, keyboard([
     [{ text: '👥 Customers & services', callback_data: 'adm:cus' }],
+    [{ text: '📈 Sales funnel', callback_data: 'adm:funnel' }, { text: '🎟 Promo codes', callback_data: 'adm:promo' }],
     [{ text: '🧾 Recent orders', callback_data: 'adm:orders' }, { text: '✅ Subscribers', callback_data: 'adm:subs' }],
     [{ text: '📢 To all', callback_data: 'adm:bc:all' }, { text: '📢 To today\'s users', callback_data: 'adm:bc:today' }],
     [{ text: '📢 To subscribers', callback_data: 'adm:bc:subs' }, { text: '📢 To never-paid', callback_data: 'adm:bc:free' }]]));
@@ -1150,6 +1155,11 @@ async function onCallback(cb) {
     if (data.startsWith('adm:c:')) return adminCustomer(chatId, data.slice(6));
     if (data.startsWith('adm:t:')) return adminTask(chatId, Number(data.slice(6)));
     if (data === 'adm:subs') return adminLists(chatId, 'subs');
+    if (data === 'adm:funnel') return funnelAdmin(chatId);
+    if (data === 'adm:backfill') return funnelBackfill(chatId);
+    if (data === 'adm:promo') return promoAdmin(chatId, '/promo list');
+    if (data === 'adm:pn:bf') return promoAdmin(chatId, '/promo create BLACKFRIDAY 30 days=5 auto');
+    if (data.startsWith('adm:pt:')) { await q('UPDATE tg_promos SET active = NOT active WHERE code = $1', [data.slice(7)]); return promoAdmin(chatId, '/promo list'); }
     if (data.startsWith('adm:bc:')) { const key = data.slice(7); if (!SEGMENTS[key]) return; const n = (await segIds(key)).length; if (!n) return send(chatId, 'That group is empty.'); adminAwait.set(String(chatId), key); return send(chatId, `Write the message for “${SEGMENTS[key].label}” (${n} users) and send it.\nTo cancel: /cancel`); }
     if (data === 'bc_yes') return doBroadcast(cb.from.id);
     if (data === 'bc_no') { pendingBroadcast.delete(String(cb.from.id)); return send(chatId, 'Cancelled.'); }
